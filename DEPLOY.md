@@ -4,10 +4,14 @@
 a container or a Python process, so serverless edge platforms (Cloudflare Workers
 or Pages) cannot run it as is.
 
-Whatever the host, set `OTAB_PASSWORD`. The server refuses to listen on a public
-address without it, and then asks every visitor for the user `otab` and that
-password. It is one shared password, not per-user access. Use the bundled example
-data, or data you are allowed to expose to everyone who has the password.
+Whatever the host, the server refuses to listen on a public address without
+sign-in. There are two ways to provide it:
+
+- **A shared password:** set `OTAB_PASSWORD`. Every visitor signs in as `otab`
+  with that password and sees all rows. Fine for the bundled example data.
+- **Personal accounts:** list `security.users` in `opentabular.yml` with hashes
+  from `otab hash-password`. Each person sees the rows their roles allow. See
+  the Security section of the README.
 
 ## Option 1: Render free web service (hosted, no cost)
 

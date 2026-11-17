@@ -26,9 +26,10 @@ from .model import Measure, Model, Table
 from .security import Identity, SecurityError, row_filters
 from .tmdl import load_model
 
+from .connections import FILE_READERS as _FILE_READERS
+from .connections import ConnectionError_, Engine, open_engine
+
 CONFIG_NAME = "opentabular.yml"
-_FILE_READERS = {".csv": "read_csv_auto", ".tsv": "read_csv_auto", ".parquet": "read_parquet",
-                 ".json": "read_json_auto"}
 
 
 class ProjectError(Exception):
@@ -107,34 +108,36 @@ class Project:
         return f"{q(table.schema_name)}.{name}" if table.schema_name else name
 
     # -- connection ------------------------------------------------------
-    def connect(self):
+    def engine(self) -> Engine:
+        """The database this project runs on, opened on first use."""
         if self._con is not None:
             return self._con
-        conn_cfg = self.config.get("connection") or {}
-        kind = str(conn_cfg.get("type", "duckdb")).lower()
-        if kind != "duckdb":
-            raise ProjectError(f"connection type '{kind}' is not supported yet (only duckdb)")
-        import duckdb
-
-        database = str(conn_cfg.get("database", ":memory:"))
-        if database != ":memory:":
-            database = str((self.root / database).resolve())
-        con = duckdb.connect(database)
+        files: dict[str, Path] = {}
         for table in self.model.tables.values():
             src = self._source(table)
             if "file" not in src:
                 continue
             file = (self.root / str(src["file"])).resolve()
-            reader = _FILE_READERS.get(file.suffix.lower())
-            if reader is None:
+            if file.suffix.lower() not in _FILE_READERS:
                 raise ProjectError(f"sources.{table.name}: unsupported file type {file.suffix}")
             if not file.exists():
                 raise ProjectError(f"sources.{table.name}: file not found: {file}")
-            path_sql = "'" + str(file).replace("'", "''") + "'"
-            view = '"' + self._view_name(table).replace('"', '""') + '"'
-            con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM {reader}({path_sql})")
-        self._con = con
-        return con
+            files[self._view_name(table)] = file
+        try:
+            self._con = open_engine(self.config.get("connection") or {}, self.root, files)
+        except ConnectionError_ as e:
+            raise ProjectError(str(e)) from None
+        return self._con
+
+    def _query(self, sql: str) -> list[tuple]:
+        try:
+            return self.engine().query(sql)
+        except ConnectionError_ as e:
+            raise ProjectError(str(e)) from None
+
+    def connect(self):
+        """The underlying driver connection (a DuckDB connection by default)."""
+        return self.engine().raw
 
     # -- queries ---------------------------------------------------------
     def compiler(self, allow_adhoc_measures: bool = False, identity: Identity | None = None) -> QueryCompiler:
@@ -156,8 +159,8 @@ class Project:
     def run(self, query: Query, allow_adhoc_measures: bool = False,
             identity: Identity | None = None) -> Result:
         compiled = self.compile(query, allow_adhoc_measures, identity)
-        cur = self.connect().execute(compiled.sql)
-        return Result([c.name for c in compiled.columns], cur.fetchall(), compiled.sql, compiled.columns)
+        rows = self._query(compiled.sql)
+        return Result([c.name for c in compiled.columns], rows, compiled.sql, compiled.columns)
 
     def run_dax(self, text: str, allow_adhoc_measures: bool = False,
                 identity: Identity | None = None) -> Result:
@@ -191,9 +194,9 @@ class Project:
                 raise CompileError("ORDER BY and TOPN can only order by a column or measure of the result")
             query.order_by.append(name + (" desc" if desc else ""))
         compiled = compiler.compile(query)
-        cur = self.connect().execute(compiled.sql)
+        rows = self._query(compiled.sql)
         names = [f"[{c.name}]" if c.kind == "measure" else str(c.source) for c in compiled.columns]
-        return Result(names, cur.fetchall(), compiled.sql, compiled.columns)
+        return Result(names, rows, compiled.sql, compiled.columns)
 
     # -- validation ------------------------------------------------------
     def validate(self, check_sources: bool = False) -> list[Issue]:
@@ -238,14 +241,14 @@ class Project:
                         "info", where, "no description (/// comment); AI clients rely on descriptions"
                     ))
         if check_sources:
-            con = self.connect()
+            engine = self.engine()
             for table in self.model.tables.values():
                 cols = [c for c in table.columns.values() if c.expression is None]
                 if not cols:
                     continue
                 rel = self.relation_for(table)
                 try:
-                    have = {d[0].casefold() for d in con.execute(f"SELECT * FROM {rel} LIMIT 0").description}
+                    have = engine.columns(rel)
                 except Exception as e:  # noqa: BLE001 - surface any driver error
                     issues.append(Issue("error", f"'{table.name}'", f"cannot read {rel}: {e}"))
                     continue

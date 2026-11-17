@@ -72,7 +72,7 @@ class DuckDBDialect:
         return f"CAST(date_trunc('{unit.lower()}', {expr}) AS DATE)"
 
     def make_date(self, y: str, m: str, d: str) -> str:
-        return f"make_date({y}, {m}, {d})"
+        return f"make_date(CAST({y} AS INTEGER), CAST({m} AS INTEGER), CAST({d} AS INTEGER))"
 
 
 # ---------------------------------------------------------------------------
@@ -1141,6 +1141,10 @@ class QueryCompiler:
             return f"EXTRACT({name} FROM {a[0]})"
         if name == "DATE":
             need(3)
+            if all(isinstance(x, A.Num) and x.text.isdigit() for x in args):
+                y, m, dd = (int(x.text) for x in args)
+                if 1 <= m <= 12 and 1 <= dd <= 31:  # a literal date is portable across databases
+                    return f"CAST('{y:04d}-{m:02d}-{dd:02d}' AS DATE)"
             return self.d.make_date(*a)
         if name in ("LEFT", "RIGHT"):
             need(1, 2)

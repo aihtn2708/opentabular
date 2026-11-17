@@ -55,3 +55,13 @@ tests:
       rows:
         - {Year: 2023, Avg Monthly Sales: 7655.82}
         - {Year: 2024, Avg Monthly Sales: 9022.16}
+
+  - name: a Vietnam Sales viewer sees Vietnam only, even through ALL()
+    roles: [Vietnam Sales]
+    query:
+      measures: [Total Sales, "% of All Products"]
+      group_by: ["Customer[Country]"]
+    expect:
+      tolerance: 0.005
+      rows:
+        - {Country: Vietnam, Total Sales: 82926.50, "% of All Products": 1.0}
