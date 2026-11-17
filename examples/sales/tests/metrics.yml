@@ -1,0 +1,57 @@
+# Metric tests: pinned results for the example data. Run with `otab test`.
+# The expected values were computed with plain SQL over data/*.csv.
+tests:
+  - name: revenue and orders by year
+    query:
+      measures: [Total Sales, Orders, Total Quantity]
+      group_by: ["'Date'[Year]"]
+    expect:
+      tolerance: 0.005
+      rows:
+        - {Year: 2023, Total Sales: 91869.85, Orders: 205, Total Quantity: 1358}
+        - {Year: 2024, Total Sales: 108265.90, Orders: 215, Total Quantity: 1391}
+
+  - name: units by category
+    query:
+      measures: [Total Quantity]
+      group_by: ["Product[Category]"]
+    expect:
+      rows:
+        - {Category: Accessories, Total Quantity: 1439}
+        - {Category: Bikes, Total Quantity: 155}
+        - {Category: Clothing, Total Quantity: 1155}
+
+  - name: last year's revenue equals the prior year's total
+    query:
+      measures: [Sales LY]
+      filters: ["'Date'[Year] = 2024"]
+    expect:
+      tolerance: 0.005
+      rows:
+        - {Sales LY: 91869.85}
+
+  - name: year to date at the end of March 2024, and one year earlier
+    query:
+      measures: [Sales YTD, Sales YTD LY]
+      filters: ["'Date'[Year Month] = \"2024-03\""]
+    expect:
+      tolerance: 0.005
+      rows:
+        - {Sales YTD: 25233.50, Sales YTD LY: 18821.80}
+
+  - name: shares add up
+    query:
+      measures: ["% of All Products"]
+      group_by: ["Product[Category]"]
+    expect:
+      row_count: 3
+
+  - name: average monthly revenue is the year's revenue over twelve months
+    query:
+      measures: [Avg Monthly Sales]
+      group_by: ["'Date'[Year]"]
+    expect:
+      tolerance: 0.005
+      rows:
+        - {Year: 2023, Avg Monthly Sales: 7655.82}
+        - {Year: 2024, Avg Monthly Sales: 9022.16}

@@ -1,0 +1,32 @@
+/// Customers, one row per customer.
+table Customer
+
+	column 'Customer Key'
+		dataType: int64
+		isHidden
+		isKey
+		sourceColumn: customer_key
+		summarizeBy: none
+
+	column Customer
+		dataType: string
+		sourceColumn: customer_name
+		summarizeBy: none
+
+	/// Country of the customer.
+	column Country
+		dataType: string
+		sourceColumn: country
+		summarizeBy: none
+
+	/// Consumer or Corporate.
+	column Segment
+		dataType: string
+		sourceColumn: segment
+		summarizeBy: none
+
+	partition Customer = entity
+		mode: directLake
+		source
+			entityName: customer
+			expressionSource: DatabaseQuery

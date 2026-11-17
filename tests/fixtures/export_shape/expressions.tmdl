@@ -1,0 +1,5 @@
+expression Server = "localhost" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]
+	lineageTag: 11
+	queryGroup: Parameters
+
+	annotation PBI_ResultType = Text

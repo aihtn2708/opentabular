@@ -1,0 +1,43 @@
+/// Calendar, one row per day from 2023-01-01 to 2024-12-31.
+table Date
+	dataCategory: Time
+
+	column Date
+		dataType: dateTime
+		isKey
+		sourceColumn: date
+		summarizeBy: none
+
+	column Year
+		dataType: int64
+		sourceColumn: year
+		summarizeBy: none
+
+	/// Calendar quarter: Q1 to Q4.
+	column Quarter
+		dataType: string
+		sourceColumn: quarter
+		summarizeBy: none
+
+	column 'Month No'
+		dataType: int64
+		sourceColumn: month_no
+		summarizeBy: none
+
+	/// Month abbreviation: Jan to Dec.
+	column Month
+		dataType: string
+		sourceColumn: month
+		summarizeBy: none
+
+	/// Year and month as YYYY-MM.
+	column 'Year Month'
+		dataType: string
+		sourceColumn: year_month
+		summarizeBy: none
+
+	partition Date = entity
+		mode: directLake
+		source
+			entityName: date
+			expressionSource: DatabaseQuery

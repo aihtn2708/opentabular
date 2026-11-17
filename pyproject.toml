@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "opentabular"
+version = "0.2.1"
+description = "An open semantic layer built on TMDL and DAX: analytics as code, compiled to SQL, served to people and AI agents."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+keywords = ["semantic layer", "DAX", "TMDL", "analytics as code", "MCP", "business intelligence"]
+dependencies = [
+    "click>=8.1",
+    "duckdb>=1.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+dialects = ["sqlglot>=25"]
+dev = ["pytest>=8", "mcp>=1.2", "sqlglot>=25"]
+
+[project.scripts]
+otab = "opentabular.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/opentabular"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

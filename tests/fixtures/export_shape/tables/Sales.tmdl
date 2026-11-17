@@ -1,0 +1,37 @@
+table Sales
+	lineageTag: aa
+
+	measure Revenue = SUM(Sales[Amount])
+		formatString: \$#,0.###############;(\$#,0.###############);\$#,0.###############
+		lineageTag: bb
+
+		annotation PBI_FormatHint = {"currencyCulture":"en-US"}
+
+	column OrderDate
+		dataType: dateTime
+		formatString: General Date
+		lineageTag: cc
+		summarizeBy: none
+		sourceColumn: OrderDate
+
+		variation Variation
+			isDefault
+			relationship: 1234-abcd
+			defaultHierarchy: LocalDateTable_x.'Date Hierarchy'
+
+		annotation SummarizationSetBy = Automatic
+
+	column Amount
+		dataType: decimal
+		sourceColumn: Amount
+
+	partition Sales = m
+		mode: import
+		source =
+				let
+				    Source = Sql.Database(Server, "db"),
+				    dbo_Sales = Source{[Schema="dbo",Item="Sales"]}[Data]
+				in
+				    dbo_Sales
+
+	annotation PBI_ResultType = Table

@@ -1,0 +1,14 @@
+# OpenTabular project file
+model: definition            # folder of .tmdl files (the semantic model)
+
+connection:
+  type: duckdb
+  database: ":memory:"
+
+# Bind model tables to data. A file becomes a view named after the table's
+# TMDL entity; use `{table: schema.name}` to point at an existing relation.
+sources:
+  Sales: data/sales.csv
+  Product: data/product.csv
+  Customer: data/customer.csv
+  Date: data/date.csv

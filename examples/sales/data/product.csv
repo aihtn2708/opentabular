@@ -1,0 +1,10 @@
+product_key,product_name,category,color,unit_cost,list_price
+1,Trail 500,Bikes,Red,420.0,780.0
+2,Trail 700,Bikes,Black,610.0,1150.0
+3,City Cruiser,Bikes,Blue,300.0,540.0
+4,Helmet Pro,Accessories,Red,18.0,45.0
+5,Bottle Cage,Accessories,Black,3.0,9.0
+6,LED Light Set,Accessories,Silver,9.0,24.0
+7,Rain Jacket,Clothing,Blue,31.0,79.0
+8,Cycling Gloves,Clothing,Black,7.0,22.0
+9,Team Jersey,Clothing,Red,16.0,49.0

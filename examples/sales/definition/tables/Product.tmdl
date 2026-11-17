@@ -1,0 +1,42 @@
+/// Products sold, one row per product.
+table Product
+
+	column 'Product Key'
+		dataType: int64
+		isHidden
+		isKey
+		sourceColumn: product_key
+		summarizeBy: none
+
+	/// Product name.
+	column Product
+		dataType: string
+		sourceColumn: product_name
+		summarizeBy: none
+
+	/// Product category: Bikes, Accessories or Clothing.
+	column Category
+		dataType: string
+		sourceColumn: category
+		summarizeBy: none
+
+	column Color
+		dataType: string
+		sourceColumn: color
+		summarizeBy: none
+
+	column 'Unit Cost'
+		dataType: double
+		sourceColumn: unit_cost
+		summarizeBy: none
+
+	column 'List Price'
+		dataType: double
+		sourceColumn: list_price
+		summarizeBy: none
+
+	partition Product = entity
+		mode: directLake
+		source
+			entityName: product
+			expressionSource: DatabaseQuery

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenTabular explorer</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fcfcfb; --panel:#f2f1ed; --rule:#e6e5e0; --ink:#0b0b0b; --ink-2:#52514e;
+    --pick:#e4eefb; --pick-edge:#2a78d6; --danger:#a12622; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1a1a19; --panel:#252523; --rule:#31302d; --ink:#f0efec;
+    --ink-2:#c3c2b7; --pick:#1d2f47; --pick-edge:#3987e5; --danger:#f08a85; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font: 14px/1.45 "Avenir Next", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+  .shell { display:grid; grid-template-columns: 280px minmax(0,1fr) 340px; min-height:100vh; }
+  aside, main, .working { padding:20px; }
+  aside { border-right:1px solid var(--rule); overflow:auto; max-height:100vh; position:sticky; top:0; }
+  .working { border-left:1px solid var(--rule); background:var(--panel); overflow:auto; max-height:100vh; position:sticky; top:0; }
+  h1 { font-size:17px; font-weight:650; margin:0; letter-spacing:-.01em; }
+  h2 { font-size:13px; font-weight:650; margin:22px 0 6px; }
+  h3 { font-size:12.5px; font-weight:500; color:var(--ink-2); margin:12px 0 2px; }
+  .sub { color:var(--ink-2); margin:2px 0 14px; font-size:13px; }
+  input[type=search], input[type=text] { width:100%; font:inherit; color:inherit; background:var(--bg);
+    border:1px solid var(--rule); border-radius:7px; padding:7px 10px; }
+  input:focus-visible, button:focus-visible, a:focus-visible { outline:2px solid var(--pick-edge); outline-offset:1px; }
+  .item { display:flex; gap:8px; align-items:baseline; width:100%; text-align:left; font:inherit; color:inherit;
+    background:none; border:0; border-left:3px solid transparent; padding:4px 8px; border-radius:0 6px 6px 0; cursor:pointer; }
+  .item:hover { background:var(--panel); }
+  .item[aria-pressed=true] { background:var(--pick); border-left-color:var(--pick-edge); }
+  .item .mark { margin-left:auto; font-size:11px; color:var(--ink-2); white-space:nowrap; }
+  .bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center; min-height:34px; }
+  .bar .word { color:var(--ink-2); margin:0 2px; }
+  .chip { display:inline-flex; align-items:center; gap:6px; background:var(--panel); border-radius:999px; padding:3px 4px 3px 11px; }
+  .chip button { border:0; background:none; color:var(--ink-2); cursor:pointer; font-size:15px; line-height:1; padding:2px 6px; border-radius:999px; }
+  .chip button:hover { color:var(--ink); background:var(--rule); }
+  .filter { display:flex; gap:8px; margin:10px 0 0; max-width:560px; }
+  .filter button, .linkish { font:inherit; border:1px solid var(--rule); background:var(--bg); color:var(--ink);
+    border-radius:7px; padding:7px 12px; cursor:pointer; white-space:nowrap; }
+  .filter button:hover { background:var(--panel); }
+  .hint { color:var(--ink-2); font-size:12.5px; margin:4px 0 0; }
+  .notice { border:1px solid var(--danger); color:var(--danger); border-radius:8px; padding:10px 12px; margin:16px 0; }
+  .empty { color:var(--ink-2); margin:48px 0; max-width:44ch; }
+  #chart { margin:22px 0 8px; } #table { margin-top:14px; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:20px 28px; margin:22px 0; }
+  nav a { color:inherit; margin-right:12px; }
+  @media (max-width: 1000px) { .shell { grid-template-columns:1fr; }
+    aside, .working { position:static; max-height:none; border:0; border-bottom:1px solid var(--rule); } }
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside>
+    <h1 id="model-name">OpenTabular</h1>
+    <p class="sub">Pick measures, then the columns to break them down by.</p>
+    <input type="search" id="find" placeholder="Find a measure or column" aria-label="Find a measure or column">
+    <div id="catalogue"></div>
+    <nav id="apps"></nav>
+  </aside>
+  <main>
+    <div class="bar" id="selection" aria-live="polite"></div>
+    <form class="filter" id="filter-form">
+      <input type="text" id="filter" placeholder="Filter, for example 'Date'[Year] = 2024" aria-label="Add a filter">
+      <button type="submit">Add filter</button>
+    </form>
+    <p class="hint">A filter is a condition on one column, written as in DAX.</p>
+    <div id="notice"></div>
+    <div id="tiles" class="tiles"></div>
+    <div id="chart"></div>
+    <div id="table"></div>
+  </main>
+  <section class="working" aria-labelledby="working-title">
+    <h1 id="working-title">How these numbers are calculated</h1>
+    <p class="sub">Each measure's definition, owner and source columns, and the SQL that ran.</p>
+    <div id="inspect"></div>
+  </section>
+</div>
+<script src="/sdk.js"></script>
+<script>
+(async function () {
+  const $ = id => document.getElementById(id);
+  const el = (tag, attrs = {}, ...kids) => {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) k.startsWith('on') ? n.addEventListener(k.slice(2), v) : n.setAttribute(k, v);
+    n.append(...kids.filter(k => k !== null));
+    return n;
+  };
+  const state = { measures: [], groupBy: [], filters: [] };
+  const params = new URLSearchParams(location.hash.slice(1));
+  for (const key of Object.keys(state)) state[key] = params.getAll(key);
+
+  let model;
+  try { model = await otab.model(); }
+  catch (e) { $('notice').replaceChildren(el('p', { class: 'notice' }, 'The model could not be loaded: ' + e.message)); return; }
+  $('model-name').textContent = model.model === 'Model' ? 'OpenTabular' : model.model;
+  document.title = 'Explorer: ' + $('model-name').textContent;
+  if (model.apps.length) {
+    $('apps').replaceChildren(el('h2', {}, 'Data apps'), ...model.apps.map(a => el('a', { href: '/apps/' + a }, a)));
+  }
+  const temporal = name => /date|year|month|quarter|week|day/i.test(name);
+  const short = ref => ref.replace(/^'([^']+)'\[(.+)\]$/, '$2');
+
+  function toggle(list, value) {
+    const i = list.indexOf(value);
+    i < 0 ? list.push(value) : list.splice(i, 1);
+    update();
+  }
+
+  function drawCatalogue() {
+    const words = $('find').value.toLowerCase().split(/\s+/).filter(Boolean);
+    const hit = (...texts) => words.every(w => texts.some(t => (t || '').toLowerCase().includes(w)));
+    const out = [el('h2', {}, 'Measures')];
+    const folders = {};
+    for (const m of model.measures) if (hit(m.name, m.description, m.folder)) (folders[m.folder || 'Other'] ||= []).push(m);
+    for (const [folder, list] of Object.entries(folders)) {
+      out.push(el('h3', {}, folder));
+      for (const m of list) {
+        out.push(el('button', { class: 'item', type: 'button', 'aria-pressed': String(state.measures.includes(m.name)),
+          title: m.description || '', onclick: () => toggle(state.measures, m.name) },
+          el('span', {}, m.name), m.trust === 'certified' ? el('span', { class: 'mark', title: 'Certified by ' + (m.owner || 'its owner') }, '✓ certified') : null));
+      }
+    }
+    out.push(el('h2', {}, 'Columns'));
+    for (const t of model.tables) {
+      const cols = t.columns.filter(c => hit(c.name, c.description, t.name));
+      if (!cols.length) continue;
+      out.push(el('h3', {}, t.name));
+      for (const c of cols) {
+        out.push(el('button', { class: 'item', type: 'button', 'aria-pressed': String(state.groupBy.includes(c.ref)),
+          title: c.description || '', onclick: () => toggle(state.groupBy, c.ref) }, el('span', {}, c.name)));
+      }
+    }
+    $('catalogue').replaceChildren(...out);
+  }
+
+  function drawSelection() {
+    const chip = (text, list, value) => el('span', { class: 'chip' }, text,
+      el('button', { type: 'button', 'aria-label': 'Remove ' + text, onclick: () => toggle(list, value) }, '×'));
+    const parts = state.measures.map(m => chip(m, state.measures, m));
+    if (state.groupBy.length) parts.push(el('span', { class: 'word' }, 'by'), ...state.groupBy.map(g => chip(short(g), state.groupBy, g)));
+    if (state.filters.length) parts.push(el('span', { class: 'word' }, 'where'), ...state.filters.map(f => chip(f, state.filters, f)));
+    $('selection').replaceChildren(...parts);
+  }
+
+  let ticket = 0;
+  async function run() {
+    const mine = ++ticket;
+    for (const id of ['notice', 'tiles', 'chart', 'table', 'inspect']) $(id).replaceChildren();
+    if (!state.measures.length && !state.groupBy.length) {
+      $('chart').replaceChildren(el('p', { class: 'empty' }, 'Pick a measure from the list to see its value. Add a column to break it down, and the definition appears on the right.'));
+      return;
+    }
+    const one = state.groupBy.length === 1 && state.measures.length > 0;
+    const timeline = one && temporal(state.groupBy[0]);
+    let result;
+    try {
+      result = await otab.query({ measures: state.measures, groupBy: state.groupBy, filters: state.filters,
+        orderBy: one && !timeline ? [state.measures[0] + ' desc'] : [], limit: 500 });
+    } catch (e) {
+      if (mine === ticket) $('notice').replaceChildren(el('p', { class: 'notice' }, e.message));
+      return;
+    }
+    if (mine !== ticket) return;
+    const measures = result.columns.filter(c => c.kind === 'measure');
+    if (!result.rows.length) {
+      $('chart').replaceChildren(el('p', { class: 'empty' }, 'No rows match. Remove a filter to widen the result.'));
+    } else if (!state.groupBy.length) {
+      $('tiles').replaceChildren(...measures.map((c, i) => {
+        const box = el('div'); otab.tile(box, { label: c.name, value: result.rows[0][i], format: c.format }); return box;
+      }));
+    } else {
+      if (timeline && result.rows.length > 1) {
+        // One axis: chart the first measure and any others that share its format.
+        otab.line($('chart'), result, { y: measures.filter(c => c.format === measures[0].format).map(c => c.name) });
+      } else if (one) {
+        otab.bars($('chart'), result);
+      }
+      otab.table($('table'), result);
+    }
+    if (measures.length) otab.inspect($('inspect'), result);
+  }
+
+  function update() {
+    const p = new URLSearchParams();
+    for (const [k, list] of Object.entries(state)) list.forEach(v => p.append(k, v));
+    history.replaceState(null, '', '#' + p.toString());
+    drawCatalogue(); drawSelection(); run();
+  }
+
+  $('find').addEventListener('input', drawCatalogue);
+  $('filter-form').addEventListener('submit', e => {
+    e.preventDefault();
+    const text = $('filter').value.trim();
+    if (text && !state.filters.includes(text)) state.filters.push(text);
+    $('filter').value = '';
+    update();
+  });
+  update();
+})();
+</script>
+</body>
+</html>

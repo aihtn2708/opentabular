@@ -1,0 +1,4 @@
+relationship 1234-abcd
+	joinOnDateBehavior: datePartOnly
+	fromColumn: Sales.OrderDate
+	toColumn: LocalDateTable_x.Date

@@ -1,0 +1,13 @@
+# Render Blueprint: one free web service built from the Dockerfile.
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: opentabular-demo
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: OTAB_PASSWORD
+        generateValue: true   # read it afterwards under Environment in the dashboard
+      - key: OTAB_USER
+        value: otab

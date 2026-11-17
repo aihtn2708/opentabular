@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revenue overview</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fcfcfb; --panel:#f2f1ed; --rule:#e6e5e0; --ink:#0b0b0b; --ink-2:#52514e; --edge:#2a78d6; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1a1a19; --panel:#252523; --rule:#31302d; --ink:#f0efec; --ink-2:#c3c2b7; --edge:#3987e5; } }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font: 14px/1.45 "Avenir Next", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+  .page { max-width:1080px; margin:0 auto; padding:28px 24px 56px; }
+  header { display:flex; flex-wrap:wrap; gap:12px 24px; align-items:end; justify-content:space-between; }
+  h1 { font-size:24px; font-weight:650; letter-spacing:-.015em; margin:0; }
+  h2 { font-size:15px; font-weight:650; margin:0 0 2px; }
+  .sub { color:var(--ink-2); margin:2px 0 0; }
+  .years { display:inline-flex; border:1px solid var(--rule); border-radius:8px; overflow:hidden; }
+  .years button { font:inherit; color:inherit; background:none; border:0; padding:6px 14px; cursor:pointer; }
+  .years button[aria-pressed=true] { background:var(--ink); color:var(--bg); }
+  button:focus-visible, a:focus-visible { outline:2px solid var(--edge); outline-offset:2px; }
+  .tiles { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:24px; margin:28px 0; padding:20px 0;
+    border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); }
+  .grid { display:grid; grid-template-columns:minmax(0,3fr) minmax(0,2fr); gap:40px; }
+  .scope { color:var(--ink-2); margin:0 0 12px; font-size:13px; }
+  .scope button { font:inherit; color:inherit; background:none; border:0; text-decoration:underline; cursor:pointer; padding:0; }
+  details { margin-top:36px; border-top:1px solid var(--rule); padding-top:16px; }
+  summary { cursor:pointer; font-weight:650; }
+  #inspect { margin-top:14px; max-width:760px; }
+  a { color:inherit; }
+  @media (max-width: 760px) { .tiles { grid-template-columns:repeat(2,minmax(0,1fr)); } .grid { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <div>
+      <h1>Revenue overview</h1>
+      <p class="sub">Example data app. Every number is a measure from the model; <a href="/">open the explorer</a>.</p>
+    </div>
+    <div class="years" role="group" aria-label="Year" id="years"></div>
+  </header>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="grid">
+    <section>
+      <h2>Revenue by month, against last year</h2>
+      <p class="scope" id="scope"></p>
+      <div id="trend"></div>
+    </section>
+    <section>
+      <h2>Revenue by category</h2>
+      <p class="scope">Select a category to filter the page.</p>
+      <div id="categories"></div>
+    </section>
+  </div>
+
+  <details>
+    <summary>How these numbers are calculated</summary>
+    <div id="inspect"></div>
+  </details>
+</div>
+
+<script src="/sdk.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const state = { year: 2024, category: null };
+const TILES = ['Total Sales', 'Sales YoY %', 'Gross Margin %', 'Orders'];
+
+function filters({ withCategory = true } = {}) {
+  const f = [{ column: "'Date'[Year]", op: '=', value: state.year }];
+  if (withCategory && state.category !== null) f.push({ column: "'Product'[Category]", op: '=', value: state.category });
+  return f;
+}
+
+async function draw() {
+  $('years').replaceChildren(...[2023, 2024].map(y => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = y; b.setAttribute('aria-pressed', String(y === state.year));
+    b.onclick = () => { state.year = y; draw(); };
+    return b;
+  }));
+  const [totals, trend, categories] = await Promise.all([
+    otab.query({ measures: TILES, filters: filters() }),
+    otab.query({ measures: ['Total Sales', 'Sales LY'], groupBy: ["'Date'[Year Month]"], filters: filters() }),
+    // The category list ignores the category selection, so it stays a menu.
+    otab.query({ measures: ['Total Sales'], groupBy: ["'Product'[Category]"], filters: filters({ withCategory: false }),
+                 orderBy: ['Total Sales desc'] }),
+  ]);
+
+  $('tiles').replaceChildren(...totals.columns.map((c, i) => {
+    const box = document.createElement('div');
+    otab.tile(box, { label: c.name, value: totals.rows.length ? totals.rows[0][i] : null, format: c.format });
+    return box;
+  }));
+
+  const scope = $('scope');
+  scope.textContent = state.category === null ? `All categories, ${state.year}. ` : `${state.category} only, ${state.year}. `;
+  if (state.category !== null) {
+    const clear = document.createElement('button');
+    clear.type = 'button'; clear.textContent = 'Show all categories';
+    clear.onclick = () => { state.category = null; draw(); };
+    scope.append(clear);
+  }
+  otab.line($('trend'), trend);
+  otab.bars($('categories'), categories, {
+    selected: state.category === null ? undefined : state.category,
+    onSelect: value => { state.category = state.category === value ? null : value; draw(); },
+  });
+  // One inspect panel for every measure on the page.
+  otab.inspect($('inspect'), {
+    columns: [...totals.columns, ...trend.columns.filter(c => c.name === 'Sales LY')],
+    sql: trend.sql, elapsed_ms: trend.elapsed_ms,
+  });
+}
+draw().catch(e => { $('tiles').textContent = 'The page could not load its data: ' + e.message; });
+</script>
+</body>
+</html>

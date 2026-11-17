@@ -1,0 +1,31 @@
+table LocalDateTable_x
+	isHidden
+	showAsVariationsOnly
+	lineageTag: dd
+
+	column Date
+		dataType: dateTime
+		isHidden
+		dataCategory: PaddedDateTableDates
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Date]
+
+		annotation SummarizationSetBy = User
+
+	column Year = YEAR([Date])
+		dataType: int64
+		isHidden
+
+	hierarchy 'Date Hierarchy'
+		lineageTag: ee
+
+		level Year
+			lineageTag: ff
+			column: Year
+
+	partition LocalDateTable_x = calculated
+		mode: import
+		source = Calendar(Date(Year(MIN('Sales'[OrderDate])), 1, 1), Date(Year(MAX('Sales'[OrderDate])), 12, 31))
+
+	annotation __PBI_LocalDateTable = true

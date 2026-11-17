@@ -1,0 +1,180 @@
+/// One row per order line.
+table Sales
+
+	/// Revenue after discount.
+	measure 'Total Sales' = SUMX(Sales, Sales[Quantity] * Sales[Unit Price] * (1 - Sales[Discount]))
+		formatString: #,##0.00
+		displayFolder: Revenue
+
+		annotation Owner = Finance
+
+		annotation Endorsement = Certified
+
+	/// Units sold.
+	measure 'Total Quantity' = SUM(Sales[Quantity])
+		formatString: #,##0
+		displayFolder: Volume
+
+	/// Cost of goods sold, at the product's unit cost.
+	measure 'Total Cost' = SUMX(Sales, Sales[Quantity] * RELATED('Product'[Unit Cost]))
+		formatString: #,##0.00
+		displayFolder: Margin
+
+	/// Revenue minus cost of goods sold.
+	measure 'Gross Margin' = [Total Sales] - [Total Cost]
+		formatString: #,##0.00
+		displayFolder: Margin
+
+	/// Gross margin as a share of revenue.
+	measure 'Gross Margin %' = DIVIDE([Gross Margin], [Total Sales])
+		formatString: 0.0%
+		displayFolder: Margin
+
+		annotation Owner = Finance
+
+	/// Number of distinct orders.
+	measure Orders = DISTINCTCOUNT(Sales[Order ID])
+		formatString: #,##0
+		displayFolder: Volume
+
+	/// Revenue per order.
+	measure 'Average Order Value' = DIVIDE([Total Sales], [Orders])
+		formatString: #,##0.00
+		displayFolder: Revenue
+
+	/// Number of distinct customers who bought.
+	measure Customers = DISTINCTCOUNT(Sales[Customer Key])
+		formatString: #,##0
+		displayFolder: Volume
+
+	/// Revenue from the online channel.
+	measure 'Online Sales' = CALCULATE([Total Sales], Sales[Channel] = "Online")
+		formatString: #,##0.00
+		displayFolder: Revenue
+
+	/// Online revenue as a share of all revenue.
+	measure 'Online Share %' = DIVIDE([Online Sales], [Total Sales])
+		formatString: 0.0%
+		displayFolder: Revenue
+
+	/// Revenue as a share of revenue across all products.
+	measure '% of All Products' = DIVIDE([Total Sales], CALCULATE([Total Sales], ALL('Product')))
+		formatString: 0.0%
+		displayFolder: Revenue
+
+	/// Order lines of five units or more.
+	measure 'Large Order Lines' = COUNTROWS(FILTER(Sales, Sales[Quantity] >= 5))
+		formatString: #,##0
+		displayFolder: Volume
+
+	/// Revenue in the same period one year earlier.
+	measure 'Sales LY' = CALCULATE([Total Sales], SAMEPERIODLASTYEAR('Date'[Date]))
+		formatString: #,##0.00
+		displayFolder: Time intelligence
+
+	/// Revenue growth against the same period one year earlier.
+	measure 'Sales YoY %' =
+			VAR Prev = [Sales LY]
+			RETURN
+				DIVIDE([Total Sales] - Prev, Prev)
+		formatString: 0.0%
+		displayFolder: Time intelligence
+
+	/// Revenue from the start of the year to the last date in context.
+	measure 'Sales YTD' = TOTALYTD([Total Sales], 'Date'[Date])
+		formatString: #,##0.00
+		displayFolder: Time intelligence
+
+	/// Year-to-date revenue one year earlier.
+	measure 'Sales YTD LY' = CALCULATE([Sales YTD], SAMEPERIODLASTYEAR('Date'[Date]))
+		formatString: #,##0.00
+		displayFolder: Time intelligence
+
+	/// Revenue over the three months ending at the last date in context.
+	measure 'Sales Rolling 3M' = ```
+			CALCULATE(
+				[Total Sales],
+				DATESINPERIOD('Date'[Date], MAX('Date'[Date]), -3, MONTH)
+			)
+			```
+		formatString: #,##0.00
+		displayFolder: Time intelligence
+
+	/// Revenue from the first date up to the last date in context.
+	measure 'Cumulative Sales' =
+			CALCULATE(
+				[Total Sales],
+				FILTER(ALL('Date'), 'Date'[Date] <= MAX('Date'[Date]))
+			)
+		formatString: #,##0.00
+		displayFolder: Time intelligence
+
+	/// Average revenue per calendar month that had sales.
+	measure 'Avg Monthly Sales' = AVERAGEX(VALUES('Date'[Year Month]), [Total Sales])
+		formatString: #,##0.00
+		displayFolder: Level of detail
+
+	/// Revenue of the best calendar month.
+	measure 'Best Month Sales' = MAXX(VALUES('Date'[Year Month]), [Total Sales])
+		formatString: #,##0.00
+		displayFolder: Level of detail
+
+	/// Customers with more than 10,000 in revenue.
+	measure 'Customers Over 10K' = COUNTROWS(FILTER(VALUES(Customer[Customer]), [Total Sales] > 10000))
+		formatString: #,##0
+		displayFolder: Level of detail
+
+	/// Rank of the product by revenue. Uses RANKX, which the compiler does not
+	/// support yet; kept here to show how `otab validate` reports it.
+	measure 'Product Rank' = RANKX(ALL('Product'[Product]), [Total Sales])
+		formatString: 0
+		displayFolder: Not yet supported
+
+	column 'Order ID'
+		dataType: int64
+		sourceColumn: order_id
+		summarizeBy: none
+
+	column 'Order Date'
+		dataType: dateTime
+		sourceColumn: order_date
+		summarizeBy: none
+
+	column 'Product Key'
+		dataType: int64
+		isHidden
+		sourceColumn: product_key
+		summarizeBy: none
+
+	column 'Customer Key'
+		dataType: int64
+		isHidden
+		sourceColumn: customer_key
+		summarizeBy: none
+
+	column Quantity
+		dataType: int64
+		sourceColumn: quantity
+		summarizeBy: sum
+
+	column 'Unit Price'
+		dataType: double
+		sourceColumn: unit_price
+		summarizeBy: none
+
+	column Discount
+		dataType: double
+		sourceColumn: discount
+		summarizeBy: none
+
+	/// Sales channel: Online or Store.
+	column Channel
+		dataType: string
+		sourceColumn: channel
+		summarizeBy: none
+
+	partition Sales = entity
+		mode: directLake
+		source
+			entityName: sales
+			expressionSource: DatabaseQuery
