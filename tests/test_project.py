@@ -11,7 +11,7 @@ EXAMPLE = "examples/sales"
 
 def test_validate_reports_unsupported_and_errors(sales, tmp_path):
     issues = sales.validate(check_sources=True)
-    assert [(i.level, i.where) for i in issues] == [("unsupported", "[Product Rank]")]
+    assert [(i.level, i.where) for i in issues] == [("unsupported", "[Top Product Names]")]
 
     (tmp_path / "m.tmdl").write_text(
         "table T\n"
@@ -109,7 +109,7 @@ def test_sql_can_be_translated_for_other_databases(sales):
     from opentabular import Query
     from opentabular.dialects import DIALECTS, DialectError, transpile
 
-    names = [m.name for m in sales.model.all_measures() if m.name != "Product Rank"]
+    names = [m.name for m in sales.model.all_measures() if m.name != "Top Product Names"]
     sql = sales.compile(Query(names, ["'Date'[Year Month]", "Product[Category]"])).sql
     assert transpile(sql, "duckdb") == sql
     for dialect in DIALECTS[1:]:

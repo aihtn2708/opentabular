@@ -41,6 +41,9 @@ table Sales
 \tmeasure 'Loop A' = [Loop B] + 1
 \tmeasure 'Loop B' = [Loop A] + 1
 \tmeasure Transition = SUMX(VALUES(Product[Category]), [Total])
+\tmeasure Shipped = CALCULATE([Total], USERELATIONSHIP(Sales[ShipDate], 'Date'[Date]))
+\tmeasure Rank = RANKX(ALL(Product[Name]), [Total])
+\tmeasure 'Amount Sum' = SUM(Sales[Amount])
 
 \tcolumn SaleDate
 \t\tdataType: dateTime
@@ -57,12 +60,22 @@ table Sales
 \tcolumn Channel
 \t\tdataType: string
 \t\tsourceColumn: channel
+\tcolumn ShipDate
+\t\tdataType: dateTime
+\t\tsourceColumn: ship_date
+\tcolumn Amount = Sales[Qty] * Sales[Price]
+\t\tdataType: double
+\tcolumn Category = RELATED(Product[Category])
+\t\tdataType: string
 
 table Product
 
 \tcolumn ProductKey
 \t\tdataType: int64
+\t\tisKey
 \t\tsourceColumn: product_key
+\tcolumn Tone = IF(Product[Color] = "Red", "Warm", "Cool")
+\t\tdataType: string
 \tcolumn Name
 \t\tdataType: string
 \t\tsourceColumn: name
@@ -92,17 +105,43 @@ relationship r1
 relationship r2
 \tfromColumn: Sales.SaleDate
 \ttoColumn: Date.Date
+
+relationship r3
+\tisActive: false
+\tfromColumn: Sales.ShipDate
+\ttoColumn: Date.Date
+
+role 'Red Only'
+\tmodelPermission: read
+
+\ttablePermission Product = Product[Color] = "Red"
+
+role 'Bikes Only'
+\tmodelPermission: read
+
+\ttablePermission Product = Product[Category] = "Bikes"
+
+role 'Online 2024'
+\tmodelPermission: read
+
+\ttablePermission Sales = Sales[Channel] = "Online"
+\ttablePermission Date = 'Date'[Year] = 2024
+
+role 'By User'
+\tmodelPermission: read
+
+\ttablePermission Product = Product[Name] = USERNAME()
 """
 
-SALES_CSV = """sale_date,product_key,qty,price,channel
-2023-01-15,1,2,100,Online
-2023-02-10,2,1,300,Store
-2023-02-20,3,5,10,Online
-2023-07-01,1,1,100,Store
-2024-01-20,1,3,100,Online
-2024-02-10,3,10,10,Store
-2024-02-29,2,2,300,Online
-2024-08-05,99,1,50,Online
+SALES_CSV = """sale_date,product_key,qty,price,channel,ship_date
+2023-01-15,1,2,100,Online,2023-01-20
+2023-02-10,2,1,300,Store,2023-03-01
+2023-02-20,3,5,10,Online,2023-02-25
+2023-07-01,1,1,100,Store,2023-07-05
+2024-01-20,1,3,100,Online,2024-01-25
+2024-02-10,3,10,10,Store,2024-02-15
+2024-02-29,2,2,300,Online,2024-03-02
+2024-08-05,99,1,50,Online,2024-08-06
 """
 
 PRODUCT_CSV = """product_key,name,category,color

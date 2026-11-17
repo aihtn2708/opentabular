@@ -135,7 +135,7 @@ def test_time_intelligence_with_a_second_dimension(sales):
 
 
 def test_every_supported_example_measure_compiles_and_runs(sales):
-    names = [m.name for m in sales.model.all_measures() if m.name != "Product Rank"]
+    names = [m.name for m in sales.model.all_measures() if m.name != "Top Product Names"]
     rows = semantic(sales, names, ["'Date'[Year]"])
     assert [r[0] for r in rows] == [2023, 2024]
     assert all(v is not None for v in rows[1][1:])
@@ -160,4 +160,52 @@ def test_level_of_detail_count_of_customers_over_a_threshold_by_year(sales):
             SELECT year(s.order_date) AS y, s.customer_key, SUM({AMOUNT}) AS amt
             FROM sales s GROUP BY 1, 2 HAVING SUM({AMOUNT}) > 10000)
         GROUP BY 1 ORDER BY 1""")
+    assert_same(got, want)
+
+
+def test_rank_and_top_three_products_by_year(sales):
+    got = semantic(sales, ["Total Sales", "Product Rank"], ["'Date'[Year]", "Product[Product]"])
+    want = sql(sales, f"""
+        SELECT year(s.order_date), p.product_name, SUM({AMOUNT}),
+               RANK() OVER (PARTITION BY year(s.order_date) ORDER BY SUM({AMOUNT}) DESC)
+        FROM sales s JOIN product p USING (product_key) GROUP BY 1, 2 ORDER BY 1, 2""")
+    assert_same(got, want)
+    got = semantic(sales, ["Top 3 Products Sales"], ["Customer[Country]"])
+    want = sql(sales, f"""
+        SELECT country, SUM(amt) FROM (
+            SELECT c.country, s.product_key, SUM({AMOUNT}) AS amt,
+                   ROW_NUMBER() OVER (PARTITION BY c.country ORDER BY SUM({AMOUNT}) DESC) AS rn
+            FROM sales s JOIN customer c USING (customer_key) GROUP BY 1, 2)
+        WHERE rn <= 3 GROUP BY 1 ORDER BY 1""")
+    assert_same(got, want)
+
+
+def test_row_by_row_average_previous_month_and_calculated_column(sales):
+    got = semantic(sales, ["Avg Sales per Customer"], ["Product[Category]", "'Date'[Year]"])
+    want = sql(sales, f"""
+        SELECT category, y, AVG(amt) FROM (
+            SELECT p.category, year(s.order_date) AS y, s.customer_key, SUM({AMOUNT}) AS amt
+            FROM sales s JOIN product p USING (product_key) GROUP BY 1, 2, 3)
+        GROUP BY 1, 2 ORDER BY 1, 2""")
+    assert_same(got, want)
+    got = semantic(sales, ["Sales Previous Month"], ["'Date'[Year Month]"])
+    want = sql(sales, f"""
+        WITH m AS (SELECT date_trunc('month', s.order_date) AS mo, SUM({AMOUNT}) AS amt FROM sales s GROUP BY 1)
+        SELECT strftime(d.mo, '%Y-%m'), m.amt
+        FROM (SELECT DISTINCT date_trunc('month', date) AS mo FROM date) d
+        JOIN m ON m.mo = d.mo - INTERVAL 1 MONTH ORDER BY 1""")
+    assert_same(got, want)
+    got = sales.run(__import__("opentabular").Query(
+        ["S = SUM(Sales[Line Amount])", "Total Sales"], ["Sales[Channel]"]), True).rows
+    assert all(a == pytest.approx(b) for _, a, b in got) and len(got) == 2
+
+
+def test_row_level_security_matches_a_filtered_query(sales):
+    from opentabular import Query
+    from opentabular.security import Identity
+
+    got = sales.run(Query(["Total Sales", "Orders", "Sales LY", "Product Rank"], ["Product[Category]"]),
+                    identity=Identity("viewer", ["Vietnam Sales"])).rows
+    want = sales.run(Query(["Total Sales", "Orders", "Sales LY", "Product Rank"], ["Product[Category]"],
+                           ['Customer[Country] = "Vietnam"'])).rows
     assert_same(got, want)

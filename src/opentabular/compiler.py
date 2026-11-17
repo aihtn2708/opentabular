@@ -72,7 +72,7 @@ class DuckDBDialect:
         return f"CAST(date_trunc('{unit.lower()}', {expr}) AS DATE)"
 
     def make_date(self, y: str, m: str, d: str) -> str:
-        return f"make_date({y}, {m}, {d})"
+        return f"make_date(CAST({y} AS INTEGER), CAST({m} AS INTEGER), CAST({d} AS INTEGER))"
 
 
 # ---------------------------------------------------------------------------
@@ -91,11 +91,13 @@ class Query:
     order_by  output column names, optionally followed by " desc"
     """
 
-    measures: list[str] = field(default_factory=list)
+    measures: list[object] = field(default_factory=list)  # names, or (name, parsed DAX)
     group_by: list[str] = field(default_factory=list)
-    filters: list[object] = field(default_factory=list)
+    filters: list[object] = field(default_factory=list)  # DAX text, dicts, or parsed DAX
     order_by: list[str] = field(default_factory=list)
     limit: int | None = None
+    # Measures defined by the query itself (DEFINE MEASURE): (table, name, parsed DAX).
+    defines: list[tuple[str, str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -148,6 +150,8 @@ class Ctx:
     # iterated columns are readable but do not filter until a measure
     # reference or CALCULATE performs the context transition.
     rowctx: bool = False
+    # Names of inactive relationships switched on by USERELATIONSHIP.
+    userel: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -155,8 +159,19 @@ class NestedLeaf:
     """An aggregate over the rows of an inner query: `SUMX(VALUES(col), [M])`."""
 
     agg: str
-    sql: str  # inner query: columns g0..gN (outer keys first), then v
+    sql: str  # inner query: columns g0..gN (outer keys first), then v (and o)
     keys: tuple[int, ...]  # outer group-by indexes of the first len(keys) columns
+    top: int | None = None  # TOPN: keep the best `top` rows per outer key, by column o
+    top_asc: bool = False
+
+
+@dataclass(frozen=True)
+class TableLeaf:
+    """An inner query kept as a table (not aggregated, not joined): RANKX
+    compares the current value against its rows."""
+
+    sql: str
+    keys: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -180,31 +195,40 @@ _SIMPLE_AGG = {
     "DISTINCTCOUNT": "DCOUNT", "DISTINCTCOUNTNOBLANK": "DCOUNT_NB",
 }
 _ITER_AGG = {"SUMX": "SUM", "AVERAGEX": "AVG", "MINX": "MIN", "MAXX": "MAX", "COUNTX": "COUNT"}
-_AGG_FUNCS = set(_SIMPLE_AGG) | set(_ITER_AGG) | {"COUNTROWS", "CALCULATE", "TOTALYTD", "TOTALQTD", "TOTALMTD"}
+_AGG_FUNCS = set(_SIMPLE_AGG) | set(_ITER_AGG) | {
+    "COUNTROWS", "CALCULATE", "TOTALYTD", "TOTALQTD", "TOTALMTD", "RANKX", "SELECTEDVALUE", "HASONEVALUE",
+}
+_PERIOD_FUNCS = {
+    "PREVIOUSDAY": ("prev", "DAY"), "PREVIOUSMONTH": ("prev", "MONTH"),
+    "PREVIOUSQUARTER": ("prev", "QUARTER"), "PREVIOUSYEAR": ("prev", "YEAR"),
+    "NEXTDAY": ("next", "DAY"), "NEXTMONTH": ("next", "MONTH"),
+    "NEXTQUARTER": ("next", "QUARTER"), "NEXTYEAR": ("next", "YEAR"),
+}
 _TIME_FUNCS = {
     "SAMEPERIODLASTYEAR", "DATEADD", "DATESYTD", "DATESQTD", "DATESMTD", "DATESINPERIOD",
-}
+    "PARALLELPERIOD",
+} | set(_PERIOD_FUNCS)
 _UNITS = {"YEAR", "QUARTER", "MONTH", "DAY"}
 _KNOWN_UNSUPPORTED = {
-    "USERELATIONSHIP", "CROSSFILTER", "ALLSELECTED", "TREATAS", "SELECTEDVALUE", "HASONEVALUE",
-    "VALUES", "DISTINCT", "SUMMARIZE", "SUMMARIZECOLUMNS", "ADDCOLUMNS", "TOPN", "RANKX",
-    "EARLIER", "LOOKUPVALUE", "CONCATENATEX", "ISFILTERED", "ISINSCOPE", "PARALLELPERIOD",
-    "PREVIOUSYEAR", "PREVIOUSQUARTER", "PREVIOUSMONTH", "PREVIOUSDAY", "NEXTYEAR", "NEXTMONTH",
-    "FIRSTDATE", "LASTDATE", "DATESBETWEEN", "CALCULATETABLE", "GENERATE", "CROSSJOIN",
+    "CROSSFILTER", "ALLSELECTED", "TREATAS",
+    "VALUES", "DISTINCT", "SUMMARIZE", "SUMMARIZECOLUMNS", "ADDCOLUMNS", "TOPN",
+    "EARLIER", "LOOKUPVALUE", "CONCATENATEX",
+    "FIRSTDATE", "LASTDATE", "CALCULATETABLE", "GENERATE", "CROSSJOIN",
 }
 
 _PURE_FUNCS = {
     "IF", "SWITCH", "DIVIDE", "COALESCE", "ISBLANK", "BLANK", "TRUE", "FALSE", "AND", "OR",
     "NOT", "MIN", "MAX", "ABS", "ROUND", "INT", "SQRT", "POWER", "MOD", "EXP", "LN", "YEAR",
     "QUARTER", "MONTH", "DAY", "DATE", "UPPER", "LOWER", "LEN", "LEFT", "RIGHT", "TRIM",
-    "CONCATENATE", "CONTAINSSTRING",
+    "CONCATENATE", "CONTAINSSTRING", "USERNAME", "USERPRINCIPALNAME",
 }
 
 # Every function the compiler accepts, exposed for documentation and tooling.
 SUPPORTED_FUNCTIONS = sorted(
     _AGG_FUNCS | _TIME_FUNCS | _PURE_FUNCS
     | {"ALL", "REMOVEFILTERS", "ALLEXCEPT", "KEEPFILTERS", "FILTER", "RELATED",
-       "VALUES", "DISTINCT", "SUMMARIZE"}
+       "VALUES", "DISTINCT", "SUMMARIZE", "TOPN", "USERELATIONSHIP", "DATESBETWEEN",
+       "ISINSCOPE", "ISFILTERED"}
 )
 
 
@@ -223,13 +247,40 @@ class QueryCompiler:
         relation_for: Callable[[Table], str] | None = None,
         dialect: DuckDBDialect | None = None,
         allow_adhoc_measures: bool = False,
+        row_filters: dict[str, str] | None = None,
+        user: str | None = None,
     ):
+        """`row_filters` maps a table name to a DAX condition that every query
+        must respect (row-level security); `user` is what USERNAME() returns."""
         self.model = model
         self.d = dialect or DuckDBDialect()
         self.relation_for = relation_for or self._default_relation
         self.allow_adhoc = allow_adhoc_measures
         self._parsed: dict[str, A.Node] = {}
         self.row_cols: frozenset[int] = frozenset()  # set only in nested compilers
+        self.user = user
+        self.defined: dict[str, Measure] = {}  # measures defined by the query itself
+        self._calc: dict[ColKey, A.Node] = {}
+        self._calc_stack: list[ColKey] = []
+        self.security: dict[str, A.Node] = {}
+        for table, dax in (row_filters or {}).items():
+            t = self.model.table(table)
+            try:
+                node = self._rowify(self._parse(dax, f"row filter on '{t.name}'"), _k(t.name), {}, {})
+            except CompileError as e:
+                raise type(e)(f"row filter on '{t.name}': {e}") from None
+            self.security[_k(t.name)] = node
+
+    def _child(self) -> "QueryCompiler":
+        """A compiler for an inner query, sharing this one's configuration."""
+        sub = QueryCompiler(self.model, self.relation_for, self.d, self.allow_adhoc)
+        sub._parsed, sub._calc = self._parsed, self._calc
+        sub.security, sub.user, sub.defined = self.security, self.user, self.defined
+        sub.leaves = {}
+        return sub
+
+    def _find_measure(self, name: str) -> Measure | None:
+        return self.defined.get(_k(name)) or self.model.find_measure(name)
 
     def _default_relation(self, table: Table) -> str:
         name = self.d.quote(table.entity_name or table.name)
@@ -239,21 +290,36 @@ class QueryCompiler:
 
     # -- public ----------------------------------------------------------
     def compile(self, query: Query) -> CompiledQuery:
-        self.leaves: dict[Leaf | NestedLeaf, int] = {}
+        self.leaves: dict[Leaf | NestedLeaf | TableLeaf, int] = {}
         self.row_cols = frozenset()
         self.group_cols: list[Column] = [self._parse_group_col(g) for g in query.group_by]
         if len({(_k(c.table), _k(c.name)) for c in self.group_cols}) != len(self.group_cols):
             raise CompileError("group_by lists the same column twice")
-        self.query_filters = tuple(self._parse_query_filter(f) for f in query.filters)
+        self.defined = {}
+        if query.defines and not self.allow_adhoc:
+            raise CompileError("DEFINE MEASURE is an ad-hoc measure (ad-hoc measures are disabled for this interface)")
+        for table, name, node in query.defines:
+            self.defined[_k(name)] = Measure(name, table, "(defined in the query)")
+            self._parsed[_k(name)] = node  # type: ignore[assignment]
+        plain = [f for f in query.filters if not isinstance(f, A.Node)]
+        self.query_filters = tuple(self._parse_query_filter(f) for f in plain)
         if not query.measures and not self.group_cols:
             raise CompileError("a query needs at least one measure or one group_by column")
 
         base = Ctx(group=tuple(range(len(self.group_cols))), filters=self.query_filters)
+        parsed = tuple(A.Call("KEEPFILTERS", (f,)) for f in query.filters if isinstance(f, A.Node))
+        if parsed:  # filters of a DAX query restrict the result; they never replace a grouping
+            base = self._apply_filters(base, parsed, {})
+            self.query_filters = base.filters
         measures: list[tuple[str, str, Measure | None]] = []  # (name, sql, model measure)
         for spec in query.measures:
             name, node, m = self._resolve_measure_spec(spec)
+            if m is not None:
+                stack: tuple[str, ...] = (_k(m.name),)
+            else:  # a DAX query may name an output after the measure it shows
+                stack = () if isinstance(spec, tuple) else (_k(name),)
             try:
-                sql = self._scalar(node, base, {}, (_k(name),))
+                sql = self._scalar(node, base, {}, stack)
             except CompileError as e:
                 raise type(e)(f"in measure [{name}]: {e}") from None
             measures.append((name, sql, m))
@@ -277,11 +343,41 @@ class QueryCompiler:
             col = self.model.column(table, column)
         except ModelError as e:
             raise CompileError(str(e)) from None
-        if col.expression is not None:
-            raise UnsupportedError(
-                f"'{col.table}'[{col.name}] is a calculated column; calculated columns are not compiled yet"
-            )
         return col
+
+    def _calc_ast(self, col: Column) -> A.Node:
+        """The row-level expression of a calculated column, in canonical form."""
+        key = (_k(col.table), _k(col.name))
+        if key not in self._calc:
+            if key in self._calc_stack:
+                raise CompileError(f"calculated column '{col.table}'[{col.name}] refers to itself")
+            self._calc_stack.append(key)
+            try:
+                node = self._parse(col.expression or "", f"calculated column '{col.table}'[{col.name}]")
+                self._calc[key] = self._rowify(node, _k(col.table), {}, {})
+                self._expr_tables(self._calc[key])  # also checks nested calculated columns
+            except CompileError as e:
+                raise type(e)(f"in calculated column '{col.table}'[{col.name}]: {e}") from None
+            finally:
+                self._calc_stack.pop()
+        return self._calc[key]
+
+    def _expr_tables(self, node: A.Node | None) -> set[str]:
+        """Tables a row-level expression reads, through calculated columns too."""
+        out: set[str] = set()
+        if node is None:
+            return out
+        for n in A.walk(node):
+            if isinstance(n, A.ColumnRef):
+                out.add(_k(n.table))
+                col = self.model.column(n.table, n.column)
+                if col.expression is not None:
+                    out |= self._expr_tables(self._calc_ast(col))
+        return out
+
+    def _colsql(self, table: str, column: str) -> str:
+        col = self.model.column(table, column)
+        return f"{self.d.quote(self.model.table(table).name)}.{self.d.quote(col.physical_name)}"
 
     def _parse_group_col(self, spec: str) -> Column:
         node = self._parse(spec, f"group_by {spec!r}")
@@ -328,10 +424,26 @@ class QueryCompiler:
             raise CompileError(f"unknown filter op {op!r}")
         return A.Binary(op, col, lit(value))
 
-    def _resolve_measure_spec(self, spec: str) -> tuple[str, A.Node, Measure | None]:
-        text = spec.strip()
+    def _resolve_measure_spec(self, spec: object) -> tuple[str, A.Node, Measure | None]:
+        if isinstance(spec, tuple):  # (output name, parsed DAX), from a DAX query
+            name, node = spec
+            target = None
+            if isinstance(node, A.BareRef):
+                target = self._find_measure(node.name)
+            elif isinstance(node, A.ColumnRef) and self.model.has_table(node.table) \
+                    and self.model.table(node.table).column(node.column) is None:
+                target = self._find_measure(node.column)
+            if target is not None and _k(target.name) not in self.defined:
+                return name, self._measure_ast(target), target  # a model measure: governed
+            if not self.allow_adhoc:
+                raise CompileError(
+                    f'"{name}" is an ad-hoc expression (ad-hoc measures are disabled for this interface); '
+                    "ask for a model measure, as in \"Name\", [Measure]"
+                )
+            return name, node, None
+        text = str(spec).strip()
         name = text[1:-1] if text.startswith("[") and text.endswith("]") else text
-        m = self.model.find_measure(name)
+        m = self._find_measure(name)
         if m is not None:
             return m.name, self._measure_ast(m), m
         if "=" in text:
@@ -364,7 +476,7 @@ class QueryCompiler:
         col = self.model.table(node.table).column(node.column)
         if col is not None:
             return self._column(node.table, node.column)
-        m = self.model.find_measure(node.column)
+        m = self._find_measure(node.column)
         if m is not None:
             return m
         raise CompileError(f"unknown column '{node.table}'[{node.column}]")
@@ -374,7 +486,7 @@ class QueryCompiler:
         rec = lambda n: self._scalar(n, ctx, env, stack)  # noqa: E731
 
         if isinstance(node, A.BareRef):
-            m = self.model.find_measure(node.name)
+            m = self._find_measure(node.name)
             if m is None:
                 raise CompileError(
                     f"[{node.name}] is not a measure, and a column cannot be used here without an aggregation"
@@ -413,11 +525,9 @@ class QueryCompiler:
                 return self._simple_agg(name, node, ctx)
             if name in _ITER_AGG:
                 self._arity(node, 2)
-                it = self._column_iter(node.args[0], ctx)
-                if it is not None:
-                    cols, cond, ctx2 = it
-                    inner = node.args[1] if cond is None else A.Call("IF", (cond, node.args[1]))
-                    return self._nested(_ITER_AGG[name], cols, inner, ctx2, env, stack)
+                plan = self._iter_plan(node.args[0], ctx, node.args[1])
+                if plan is not None:
+                    return self._nested(_ITER_AGG[name], plan, env, stack)
                 base, row_filters, ctx2 = self._table_arg(node.args[0], ctx, env)
                 expr = self._rowify(node.args[1], base, env, {})
                 return self._leaf(_ITER_AGG[name], base, expr, row_filters, ctx2)
@@ -427,11 +537,9 @@ class QueryCompiler:
                 if isinstance(arg, A.Call) and arg.name in ("VALUES", "DISTINCT") and len(arg.args) == 1 \
                         and isinstance(arg.args[0], A.ColumnRef):
                     return self._simple_agg("DISTINCTCOUNT", A.Call("DISTINCTCOUNT", arg.args), ctx)
-                it = self._column_iter(arg, ctx)
-                if it is not None:
-                    cols, cond, ctx2 = it
-                    one = A.Num("1") if cond is None else A.Call("IF", (cond, A.Num("1")))
-                    return self._nested("SUM", cols, one, ctx2, env, stack)
+                plan = self._iter_plan(arg, ctx, A.Num("1"))
+                if plan is not None:
+                    return self._nested("SUM", plan, env, stack)
                 base, row_filters, ctx2 = self._table_arg(arg, ctx, env)
                 return self._leaf("COUNTROWS", base, None, row_filters, ctx2)
             if name == "CALCULATE":
@@ -446,7 +554,32 @@ class QueryCompiler:
                 new_ctx = self._apply_filters(self._transition(ctx), (dates,) + tuple(node.args[2:]), env)
                 return self._scalar(node.args[0], new_ctx, env, stack)
             if name == "RELATED":
+                if ctx.rowctx and len(node.args) == 1:
+                    return rec(node.args[0])
                 raise CompileError("RELATED needs a row context (use it inside SUMX, FILTER, ...)")
+            if name in ("SELECTEDVALUE", "HASONEVALUE"):
+                self._arity(node, *((1, 2) if name == "SELECTEDVALUE" else (1,)))
+                col = self._resolve_colref(node.args[0]) if isinstance(node.args[0], A.ColumnRef) else None
+                if not isinstance(col, Column):
+                    raise CompileError(f"{name} expects a column reference such as Table[Column]")
+                ref = A.ColumnRef(col.table, col.name)
+                if name == "HASONEVALUE":
+                    return f"COALESCE({self._leaf('HASONE', _k(col.table), ref, (), ctx)}, FALSE)"
+                value = self._leaf("ONEVALUE", _k(col.table), ref, (), ctx)
+                return f"COALESCE({value}, {rec(node.args[1])})" if len(node.args) == 2 else value
+            if name in ("ISINSCOPE", "ISFILTERED"):
+                self._arity(node, 1)
+                col = self._resolve_colref(node.args[0]) if isinstance(node.args[0], A.ColumnRef) else None
+                if not isinstance(col, Column):
+                    raise CompileError(f"{name} expects a column reference such as Table[Column]")
+                key = (_k(col.table), _k(col.name))
+                grouped = any(
+                    (_k(self.group_cols[i].table), _k(self.group_cols[i].name)) == key for i in ctx.group
+                )
+                filtered = grouped or (name == "ISFILTERED" and any(key in f.columns for f in ctx.filters))
+                return "TRUE" if filtered else "FALSE"
+            if name == "RANKX":
+                return self._rankx(node, ctx, env, stack)
         return self._pure(node, rec)
 
     def _measure_ref(self, m: Measure, ctx: Ctx, stack: tuple[str, ...]) -> str:
@@ -551,12 +684,132 @@ class QueryCompiler:
             return cols, exists, ctx
         return None
 
-    def _nested(
-        self, agg: str, iter_cols: list[Column], inner: A.Node, ctx: Ctx,
+    def _needs_transition(self, node: A.Node) -> bool:
+        """True if evaluating `node` per row needs context transition."""
+        for n in A.walk(node):
+            if isinstance(n, A.BareRef) and self._find_measure(n.name) is not None:
+                return True
+            if isinstance(n, A.ColumnRef) and self.model.has_table(n.table) \
+                    and self.model.table(n.table).column(n.column) is None \
+                    and self._find_measure(n.column) is not None:
+                return True
+            if isinstance(n, A.Call) and n.name in _AGG_FUNCS:
+                return True
+        return False
+
+    def _qualify(self, node: A.Node, table: Table) -> A.Node:
+        """Turn [Column] into Table[Column] and drop RELATED, for a row of `table`."""
+        q = lambda n: self._qualify(n, table)  # noqa: E731
+        if isinstance(node, A.BareRef):
+            if self._find_measure(node.name) is None and table.column(node.name) is not None:
+                return A.ColumnRef(table.name, table.column(node.name).name)
+            return node
+        if isinstance(node, A.Call):
+            if node.name == "RELATED" and len(node.args) == 1:
+                return q(node.args[0])
+            return A.Call(node.name, tuple(q(a) for a in node.args))
+        if isinstance(node, A.Unary):
+            return A.Unary(node.op, q(node.operand))
+        if isinstance(node, A.Binary):
+            return A.Binary(node.op, q(node.left), q(node.right))
+        if isinstance(node, A.SetLiteral):
+            return A.SetLiteral(tuple(q(a) for a in node.items))
+        if isinstance(node, A.VarBlock):
+            return A.VarBlock(tuple((n, q(e)) for n, e in node.vars), q(node.body))
+        return node
+
+    def _row_iter(
+        self, src: A.Node, ctx: Ctx, exprs: list[A.Node],
+    ) -> tuple[list[Column], A.Node | None, Ctx, list[A.Node]] | None:
+        """Iterate the rows of a table (optionally filtered) with context
+        transition. A row is identified by the table's key column, so the
+        rows are the values of the key plus the columns the expressions read."""
+        conds: list[A.Node] = []
+        node = src
+        while isinstance(node, A.Call) and node.name == "FILTER" and len(node.args) == 2:
+            conds.append(node.args[1])
+            node = node.args[0]
+        remove = False
+        if isinstance(node, A.Call) and node.name in ("ALL", "VALUES", "DISTINCT") and len(node.args) == 1:
+            remove = node.name == "ALL"
+            node = node.args[0]
+        table = self._table_of(node)
+        if table is None:
+            return None
+        key = self.model.key_column(table.name)
+        if key is None:
+            raise UnsupportedError(
+                f"iterating '{table.name}' row by row with a measure needs a key column: mark one with "
+                "isKey, relate another table to it, or iterate VALUES of a column instead"
+            )
+        if remove:
+            ctx = self._remove(ctx, tables=self.model.expanded(table.name))
+        reach = self.model.paths_from(table.name)
+        exprs = [self._qualify(e, table) for e in exprs]
+        conds = [self._qualify(c, table) for c in conds]
+        cols, seen = [key], {(_k(table.name), _k(key.name))}
+        for e in exprs + conds:
+            for n in A.walk(e):
+                if isinstance(n, A.ColumnRef) and self.model.has_table(n.table) and _k(n.table) in reach:
+                    col = self.model.table(n.table).column(n.column)
+                    if col is not None and (_k(col.table), _k(col.name)) not in seen:
+                        seen.add((_k(col.table), _k(col.name)))
+                        cols.append(col)
+        cond = None
+        for c in conds:
+            cond = c if cond is None else A.Binary("&&", cond, c)
+        return cols, cond, ctx, exprs
+
+    def _iter_plan(self, src: A.Node, ctx: Ctx, expr: A.Node) -> dict | None:
+        """Decide whether an iterator needs an inner query. Returns None when
+        the plain row-by-row path (no measures involved) is enough."""
+        top = None
+        order: A.Node | None = None
+        if isinstance(src, A.Call) and src.name == "TOPN":
+            if len(src.args) not in (3, 4):
+                raise UnsupportedError("TOPN is supported as TOPN(n, table, order expression [, ASC|DESC])")
+            n = self._int_literal(src.args[0])
+            if n is None or n < 1:
+                raise UnsupportedError("TOPN needs a literal positive number of rows")
+            order = src.args[2]
+            asc = len(src.args) == 4 and self._is_ascending(src.args[3])
+            top, src = (n, asc), src.args[1]
+        exprs = [expr] + ([order] if order is not None else [])
+        it = self._column_iter(src, ctx)
+        if it is not None:
+            cols, cond, ctx2 = it
+        else:
+            probe = src
+            conds = []
+            while isinstance(probe, A.Call) and probe.name == "FILTER" and len(probe.args) == 2:
+                conds.append(probe.args[1])
+                probe = probe.args[0]
+            if top is None and not any(self._needs_transition(e) for e in exprs + conds):
+                return None
+            found = self._row_iter(src, ctx, exprs)
+            if found is None:
+                if top is not None:
+                    raise UnsupportedError("TOPN over this table expression is not supported yet")
+                return None
+            cols, cond, ctx2, exprs = found
+        if cond is not None:
+            exprs = [A.Call("IF", (cond, e)) for e in exprs]
+        return {"cols": cols, "exprs": exprs, "ctx": ctx2, "top": top}
+
+    @staticmethod
+    def _is_ascending(node: A.Node) -> bool:
+        if isinstance(node, A.NameRef):
+            return node.name.upper() == "ASC"
+        if isinstance(node, A.Bool):
+            return node.value
+        return isinstance(node, A.Num) and node.text not in ("0", "0.0")
+
+    def _nested_sql(
+        self, iter_cols: list[Column], exprs: list[A.Node], ctx: Ctx,
         env: dict[str, _Var], stack: tuple[str, ...],
-    ) -> str:
-        """Compile `AGGX(<values of columns>, inner)` as an aggregate over an
-        inner query grouped by the outer keys plus the iterated columns."""
+    ) -> tuple[str, tuple[int, ...]]:
+        """SQL of an inner query grouped by the outer keys plus the iterated
+        columns. Its columns are g0..gN (outer keys first), then v (and o)."""
         if ctx.rowctx:
             raise UnsupportedError("an iterator nested inside another column iterator is not supported yet")
         if ctx.time_ops and ctx.time_col is not None and any(
@@ -565,14 +818,15 @@ class QueryCompiler:
             raise UnsupportedError(
                 "iterating date-table columns inside time intelligence is not supported yet"
             )
-        for n in A.walk(inner):
-            if isinstance(n, A.NameRef):
-                var = env.get(_k(n.name))
-                if var is not None and var.ast is None:
-                    raise UnsupportedError(
-                        f"variable '{n.name}' holds an aggregated value and is used inside an iterator, "
-                        "which is not supported yet"
-                    )
+        for e in exprs:
+            for n in A.walk(e):
+                if isinstance(n, A.NameRef):
+                    var = env.get(_k(n.name))
+                    if var is not None and var.ast is None:
+                        raise UnsupportedError(
+                            f"variable '{n.name}' holds an aggregated value and is used inside an "
+                            "iterator, which is not supported yet"
+                        )
         cols = [self.group_cols[i] for i in ctx.group]
         n_outer = len(cols)
         row_cols: set[int] = set()
@@ -584,21 +838,59 @@ class QueryCompiler:
                 pos = len(cols) - 1
             row_cols.add(pos)
 
-        sub = QueryCompiler(self.model, self.relation_for, self.d, self.allow_adhoc)
-        sub._parsed = self._parsed
-        sub.leaves = {}
+        sub = self._child()
         sub.group_cols = cols
         sub.row_cols = frozenset(row_cols)
         sub.query_filters = ctx.filters
-        sub_ctx = Ctx(tuple(range(n_outer)), ctx.filters, ctx.time_col, ctx.time_ops, rowctx=True)
-        value = sub._scalar(inner, sub_ctx, {k: v for k, v in env.items() if v.ast is not None}, stack)
+        sub_ctx = Ctx(tuple(range(n_outer)), ctx.filters, ctx.time_col, ctx.time_ops,
+                      rowctx=True, userel=ctx.userel)
+        env_sub = {k: v for k, v in env.items() if v.ast is not None}
+        values = [sub._scalar(e, sub_ctx, env_sub, stack) for e in exprs]
         ctes, from_ = sub._core()
-        select = [f'"s"."g{j}" AS "g{j}"' for j in range(len(cols))] + [f'{value} AS "v"']
+        select = [f'"s"."g{j}" AS "g{j}"' for j in range(len(cols))]
+        select += [f'{v} AS "{name}"' for v, name in zip(values, ("v", "o"))]
         sql = ("WITH " + ",\n".join(ctes) + "\n" if ctes else "") + "SELECT " + ", ".join(select)
-        sql += "\n" + "\n".join(from_)
-        leaf = NestedLeaf(agg, sql, ctx.group)
+        return sql + "\n" + "\n".join(from_), ctx.group
+
+    def _nested(self, agg: str, plan: dict, env: dict[str, _Var], stack: tuple[str, ...]) -> str:
+        """Compile `AGGX(<rows>, expr)` as an aggregate over an inner query."""
+        sql, keys = self._nested_sql(plan["cols"], plan["exprs"], plan["ctx"], env, stack)
+        top = plan["top"]
+        leaf = NestedLeaf(agg, sql, keys, top[0] if top else None, bool(top and top[1]))
         idx = self.leaves.setdefault(leaf, len(self.leaves))
         return f'"l{idx}"."v"'
+
+    def _rankx(self, node: A.Call, ctx: Ctx, env: dict[str, _Var], stack: tuple[str, ...]) -> str:
+        """RANKX(table, expr [, value [, order [, ties]]]): one plus the number
+        of rows of `table` whose expr beats the current value."""
+        if not 2 <= len(node.args) <= 5:
+            raise CompileError("RANKX takes 2 to 5 arguments")
+        args = list(node.args) + [A.Call("BLANK", ())] * (5 - len(node.args))
+        blank = lambda n: isinstance(n, A.Call) and n.name == "BLANK"  # noqa: E731
+        it = self._column_iter(args[0], ctx)
+        if it is not None:
+            cols, cond, ctx2 = it
+            expr = args[1]
+        else:
+            found = self._row_iter(args[0], ctx, [args[1]])
+            if found is None:
+                raise UnsupportedError("RANKX over this table expression is not supported yet")
+            cols, cond, ctx2, (expr,) = found
+        if cond is not None:
+            expr = A.Call("IF", (cond, expr))
+        sql, keys = self._nested_sql(cols, [expr], ctx2, env, stack)
+        idx = self.leaves.setdefault(TableLeaf(sql, keys), len(self.leaves))
+        value = self._scalar(args[1] if blank(args[2]) else args[2], ctx, env, stack)
+        asc = not blank(args[3]) and self._is_ascending(args[3])
+        dense = isinstance(args[4], A.NameRef) and args[4].name.upper() == "DENSE"
+        match = "".join(
+            self.d.null_safe_eq(f'"n"."g{j}"', f'"s"."g{i}"') + " AND " for j, i in enumerate(keys)
+        )
+        count = 'COUNT(DISTINCT "n"."v")' if dense else "COUNT(*)"
+        return (
+            f"(CASE WHEN {value} IS NULL THEN NULL ELSE "
+            f'(SELECT {count} + 1 FROM "l{idx}" AS "n" WHERE {match}"n"."v" {"<" if asc else ">"} {value}) END)'
+        )
 
     # -- table arguments (iterators) -------------------------------------
     def _table_arg(self, node: A.Node, ctx: Ctx, env: dict[str, _Var]) -> tuple[str, tuple[A.Node, ...], Ctx]:
@@ -637,7 +929,7 @@ class QueryCompiler:
                 if col is not None:
                     c = self._column(col.table, col.name)
                     return A.ColumnRef(c.table, c.name)
-            if self.model.find_measure(node.name) is not None:
+            if self._find_measure(node.name) is not None:
                 raise UnsupportedError(
                     f"measure [{node.name}] is referenced inside a row context "
                     "(context transition), which is not supported yet"
@@ -691,8 +983,18 @@ class QueryCompiler:
             return A.Call(node.name, tuple(rec(a) for a in node.args))
         raise CompileError("expression is not valid in a row context")
 
-    def _row_sql(self, node: A.Node, colsql: Callable[[str, str], str]) -> str:
+    def _row_sql(self, node: A.Node, colsql: Callable[[str, str], str] | None = None) -> str:
+        colsql = colsql or self._colsql
         if isinstance(node, A.ColumnRef):
+            col = self.model.column(node.table, node.column)
+            if col.expression is not None:
+                inner = self._row_sql(self._calc_ast(col), colsql)
+                key = self.model.key_column(col.table)
+                if key is not None and key.expression is None:
+                    # No calculated value on the blank row that stands in for
+                    # fact rows without a matching row in this table.
+                    return f"(CASE WHEN {colsql(key.table, key.name)} IS NULL THEN NULL ELSE {inner} END)"
+                return f"({inner})"
             return colsql(node.table, node.column)
         return self._pure(node, lambda n: self._row_sql(n, colsql))
 
@@ -839,6 +1141,10 @@ class QueryCompiler:
             return f"EXTRACT({name} FROM {a[0]})"
         if name == "DATE":
             need(3)
+            if all(isinstance(x, A.Num) and x.text.isdigit() for x in args):
+                y, m, dd = (int(x.text) for x in args)
+                if 1 <= m <= 12 and 1 <= dd <= 31:  # a literal date is portable across databases
+                    return f"CAST('{y:04d}-{m:02d}-{dd:02d}' AS DATE)"
             return self.d.make_date(*a)
         if name in ("LEFT", "RIGHT"):
             need(1, 2)
@@ -846,6 +1152,11 @@ class QueryCompiler:
         if name == "CONCATENATE":
             need(2)
             return f"(COALESCE(CAST({a[0]} AS VARCHAR), '') || COALESCE(CAST({a[1]} AS VARCHAR), ''))"
+        if name in ("USERNAME", "USERPRINCIPALNAME"):
+            need(0)
+            if self.user is None:
+                raise CompileError(f"{name}() needs a signed-in user; pass one with --user")
+            return self.d.string(self.user)
         if name == "CONTAINSSTRING":
             need(2)
             return f"(POSITION(LOWER({a[1]}) IN LOWER({a[0]})) > 0)"
@@ -900,6 +1211,7 @@ class QueryCompiler:
         keep: set[ColKey] = set()
         adds: list[Filter] = []
         time: list[tuple[ColKey, TimeOp]] = []
+        userel: set[str] = set()
 
         def removal_targets(args: tuple[A.Node, ...], fn: str) -> None:
             nonlocal rm_all
@@ -950,6 +1262,37 @@ class QueryCompiler:
                     self._arity(arg, 1)
                     classify(arg.args[0], False)
                     return
+                if name == "USERELATIONSHIP":
+                    self._arity(arg, 2)
+                    ends = [self._resolve_colref(a) if isinstance(a, A.ColumnRef) else None for a in arg.args]
+                    if not all(isinstance(e, Column) for e in ends):
+                        raise CompileError("USERELATIONSHIP expects two columns")
+                    rel = self.model.find_relationship(
+                        (ends[0].table, ends[0].name), (ends[1].table, ends[1].name))
+                    if rel is None:
+                        raise CompileError(
+                            f"no relationship between '{ends[0].table}'[{ends[0].name}] and "
+                            f"'{ends[1].table}'[{ends[1].name}]"
+                        )
+                    userel.add(rel.name)
+                    return
+                if name == "DATESBETWEEN":
+                    self._arity(arg, 3)
+                    col = self._date_col(arg.args[0], name)
+                    c = self.model.column(*col)
+                    ref: A.Node = A.ColumnRef(c.table, c.name)
+                    parts = []
+                    for op, bound in ((">=", arg.args[1]), ("<=", arg.args[2])):
+                        if isinstance(bound, A.Call) and bound.name == "BLANK":
+                            continue
+                        if not self._const_with(bound, env):
+                            raise UnsupportedError("DATESBETWEEN needs fixed dates such as DATE(2024, 1, 1)")
+                        parts.append(A.Binary(op, ref, self._inline_consts(bound, env)))
+                    rm_tables.add(col[0])  # a date filter replaces the filters on the date table
+                    if parts:
+                        expr = parts[0] if len(parts) == 1 else A.Binary("&&", parts[0], parts[1])
+                        adds.append(Filter(frozenset({col}), expr))
+                    return
                 if name == "FILTER":
                     self._arity(arg, 2)
                     src, cond = arg.args
@@ -993,6 +1336,8 @@ class QueryCompiler:
                     "a filter on the date table inside time intelligence is not supported yet"
                 )
         new = replace(new, filters=new.filters + tuple(f for f in adds if f not in new.filters))
+        if userel:
+            new = replace(new, userel=new.userel | frozenset(userel))
         for col, op in time:
             if any(col[0] in f.tables for f in adds):
                 raise UnsupportedError(
@@ -1055,6 +1400,16 @@ class QueryCompiler:
                     "DATESINPERIOD is supported as DATESINPERIOD(dates, MAX(dates), -N, <interval>)"
                 )
             return col, TimeOp("window", n, self._unit(args[3], name))
+        if name in _PERIOD_FUNCS:
+            self._arity(call, 1)
+            kind, unit = _PERIOD_FUNCS[name]
+            return self._date_col(args[0], name), TimeOp(kind, 0, unit)
+        if name == "PARALLELPERIOD":
+            self._arity(call, 3)
+            n = self._int_literal(args[1])
+            if n is None:
+                raise UnsupportedError("PARALLELPERIOD needs a literal number of intervals")
+            return self._date_col(args[0], name), TimeOp("parallel", n, self._unit(args[2], name))
         raise UnsupportedError(f"{name} is not supported yet")
 
     def _time_from_predicate(self, node: A.Node) -> tuple[ColKey, TimeOp] | None:
@@ -1079,105 +1434,124 @@ class QueryCompiler:
 
     # -- leaves ----------------------------------------------------------
     def _leaf(self, agg: str, base: str, expr: A.Node | None, row_filters: tuple[A.Node, ...], ctx: Ctx) -> str:
-        reach = self.model.paths_from(base)
+        reach = self.model.paths_from(base, ctx.userel)
         group = tuple(i for i in ctx.group if _k(self.group_cols[i].table) in reach)
         filters = tuple(f for f in ctx.filters if all(t in reach for t in f.tables))
         time_col, time_ops = ctx.time_col, ctx.time_ops
         if not time_ops or time_col is None or time_col[0] not in reach:
             time_col, time_ops = None, ()
-        leaf = Leaf(agg, base, expr, row_filters, Ctx(group, filters, time_col, time_ops))
+        leaf = Leaf(agg, base, expr, row_filters, Ctx(group, filters, time_col, time_ops, userel=ctx.userel))
         idx = self.leaves.setdefault(leaf, len(self.leaves))
         return f'"l{idx}"."v"'
 
-    def _nested_leaf_sql(self, leaf: NestedLeaf) -> tuple[str, tuple[int, ...]]:
-        agg = {
-            "SUM": 'SUM("n"."v")', "AVG": 'AVG("n"."v")', "MIN": 'MIN("n"."v")',
-            "MAX": 'MAX("n"."v")', "COUNT": 'NULLIF(COUNT("n"."v"), 0)',
-        }[leaf.agg]
-        select = [f'"n"."g{j}" AS "g{i}"' for j, i in enumerate(leaf.keys)] + [f'{agg} AS "v"']
-        sql = "SELECT " + ", ".join(select) + f'\nFROM (\n{_indent(leaf.sql)}\n) AS "n"'
-        if leaf.keys:
-            sql += "\nGROUP BY " + ", ".join(f'"n"."g{j}"' for j in range(len(leaf.keys)))
-        return sql, leaf.keys
-
-    def _leaf_sql(self, leaf: Leaf | NestedLeaf) -> tuple[str, tuple[int, ...]]:
-        if isinstance(leaf, NestedLeaf):
-            return self._nested_leaf_sql(leaf)
+    def _source(self, base: str, tables: set[str], userel: frozenset[str] = frozenset()) -> tuple[list[str], list[str]]:
+        """FROM clause for `base` joined (many-to-one) to the given tables,
+        plus the row-level security conditions that apply. Security filters
+        are added for every secured table the base reaches, whether or not
+        the query mentions it, so no CALCULATE can remove them."""
         d, model = self.d, self.model
-        base = model.table(leaf.base)
-        paths = model.paths_from(leaf.base)
-        ctx = leaf.ctx
-        time_t = ctx.time_col[0] if ctx.time_col else None
+        paths = model.paths_from(base, userel)
+        need: list[str] = []
 
-        def colsql(table: str, column: str) -> str:
-            col = model.column(table, column)
-            return f"{d.quote(model.table(table).name)}.{d.quote(col.physical_name)}"
-
-        needed: list[str] = []
-
-        def need(table_key: str) -> None:
-            for rel in paths[table_key]:
+        def add(table_key: str) -> None:
+            for rel in paths.get(table_key, []):
                 k = _k(rel.to_table)
-                if k not in needed:
-                    needed.append(k)
+                if k not in need:
+                    need.append(k)
 
-        def need_expr(node: A.Node | None) -> None:
-            if node is None:
-                return
-            for n in A.walk(node):
-                if isinstance(n, A.ColumnRef):
-                    need(_k(n.table))
-
-        need_expr(leaf.expr)
-        for rf in leaf.row_filters:
-            need_expr(rf)
+        for tk in tables:
+            add(tk)
         where: list[str] = []
-        ctx_filters: list[Filter] = []
-        for f in ctx.filters:
-            if time_t is not None and f.tables == {time_t}:
-                ctx_filters.append(f)
-                continue
-            for t in f.tables:
-                need(t)
-            where.append(self._row_sql(f.expr, colsql))
-        for rf in leaf.row_filters:
-            where.append(self._row_sql(rf, colsql))
-
-        select: list[str] = []
-        group_by: list[str] = []
-        ctx_group: list[int] = []
-        for i in ctx.group:
-            col = self.group_cols[i]
-            if time_t is not None and _k(col.table) == time_t:
-                ctx_group.append(i)
-                expr = f'"dctx"."g{i}"'
-            else:
-                need(_k(col.table))
-                expr = colsql(col.table, col.name)
-            select.append(f'{expr} AS "g{i}"')
-            group_by.append(expr)
-
-        if time_t is not None:
-            need(time_t)
-
-        from_ = [f"FROM {self.relation_for(base)} AS {d.quote(base.name)}"]
+        for tk, pred in self.security.items():
+            if tk in paths:
+                add(tk)
+                for t2 in self._expr_tables(pred):
+                    add(t2)
+                where.append(self._row_sql(pred))
+        t0 = model.table(base)
+        lines = [f"FROM {self.relation_for(t0)} AS {d.quote(t0.name)}"]
         joined: set[str] = set()
-        for tk in needed:
+        for tk in need:
             for rel in paths[tk]:
                 k = _k(rel.to_table)
                 if k in joined:
                     continue
                 joined.add(k)
                 t = model.table(rel.to_table)
-                from_.append(
+                lines.append(
                     f"LEFT JOIN {self.relation_for(t)} AS {d.quote(t.name)} "
-                    f"ON {colsql(rel.from_table, rel.from_column)} = {colsql(rel.to_table, rel.to_column)}"
+                    f"ON {self._colsql(rel.from_table, rel.from_column)} = "
+                    f"{self._colsql(rel.to_table, rel.to_column)}"
                 )
+        return lines, where
 
+    def _group_ref(self, i: int) -> A.ColumnRef:
+        col = self.group_cols[i]
+        return A.ColumnRef(col.table, col.name)
+
+    def _nested_leaf_sql(self, leaf: NestedLeaf) -> tuple[str, tuple[int, ...]]:
+        agg = {
+            "SUM": 'SUM("n"."v")', "AVG": 'AVG("n"."v")', "MIN": 'MIN("n"."v")',
+            "MAX": 'MAX("n"."v")', "COUNT": 'NULLIF(COUNT("n"."v"), 0)',
+        }[leaf.agg]
+        keys = [f'"g{j}"' for j in range(len(leaf.keys))]
+        inner = leaf.sql
+        if leaf.top is not None:
+            part = f"PARTITION BY {', '.join(keys)} " if keys else ""
+            direction = "ASC" if leaf.top_asc else "DESC"
+            inner = (
+                f'SELECT * FROM (\n  SELECT "q".*, RANK() OVER ({part}ORDER BY "o" {direction} NULLS LAST) AS "rk"'
+                f'\n  FROM (\n{_indent(leaf.sql, 4)}\n  ) AS "q"\n) AS "q2" WHERE "rk" <= {leaf.top}'
+            )
+        select = [f'"n"."g{j}" AS "g{i}"' for j, i in enumerate(leaf.keys)] + [f'{agg} AS "v"']
+        sql = "SELECT " + ", ".join(select) + f'\nFROM (\n{_indent(inner)}\n) AS "n"'
+        if leaf.keys:
+            sql += "\nGROUP BY " + ", ".join(f'"n"."g{j}"' for j in range(len(leaf.keys)))
+        return sql, leaf.keys
+
+    def _leaf_sql(self, leaf: Leaf | NestedLeaf | TableLeaf) -> tuple[str, tuple[int, ...]]:
+        if isinstance(leaf, TableLeaf):
+            return leaf.sql, leaf.keys
+        if isinstance(leaf, NestedLeaf):
+            return self._nested_leaf_sql(leaf)
+        ctx = leaf.ctx
+        time_t = ctx.time_col[0] if ctx.time_col else None
+
+        tables = self._expr_tables(leaf.expr)
+        where: list[str] = []
+        ctx_filters: list[Filter] = []
+        for f in ctx.filters:
+            if time_t is not None and f.tables == {time_t}:
+                ctx_filters.append(f)
+                continue
+            tables |= self._expr_tables(f.expr)
+            where.append(self._row_sql(f.expr))
+        for rf in leaf.row_filters:
+            tables |= self._expr_tables(rf)
+            where.append(self._row_sql(rf))
+
+        select: list[str] = []
+        group_by: list[str] = []
+        ctx_group: list[int] = []
+        for i in ctx.group:
+            ref = self._group_ref(i)
+            if time_t is not None and _k(ref.table) == time_t:
+                ctx_group.append(i)
+                expr = f'"dctx"."g{i}"'
+            else:
+                tables |= self._expr_tables(ref)
+                expr = self._row_sql(ref)
+            select.append(f'{expr} AS "g{i}"')
+            group_by.append(expr)
         if time_t is not None:
-            from_.append(self._time_join(leaf, colsql, ctx_filters, ctx_group))
+            tables.add(time_t)
 
-        x = self._row_sql(leaf.expr, colsql) if leaf.expr is not None else None
+        from_, secured = self._source(leaf.base, tables, ctx.userel)
+        where = secured + where
+        if time_t is not None:
+            from_.append(self._time_join(leaf, ctx_filters, ctx_group))
+
+        x = self._row_sql(leaf.expr) if leaf.expr is not None else None
         agg = {
             "SUM": f"SUM({x})",
             "AVG": f"AVG({x})",
@@ -1187,6 +1561,8 @@ class QueryCompiler:
             "DCOUNT": f"NULLIF(COUNT(DISTINCT {x}) + MAX(CASE WHEN {x} IS NULL THEN 1 ELSE 0 END), 0)",
             "DCOUNT_NB": f"NULLIF(COUNT(DISTINCT {x}), 0)",
             "COUNTROWS": "NULLIF(COUNT(*), 0)",
+            "ONEVALUE": f"CASE WHEN COUNT(DISTINCT {x}) = 1 THEN MIN({x}) END",
+            "HASONE": f"(COUNT(DISTINCT {x}) = 1)",
         }[leaf.agg]
         select.append(f'{agg} AS "v"')
 
@@ -1197,57 +1573,65 @@ class QueryCompiler:
             parts.append("GROUP BY " + ", ".join(group_by))
         return "\n".join(parts), ctx.group
 
-    def _time_join(
-        self,
-        leaf: Leaf,
-        colsql: Callable[[str, str], str],
-        ctx_filters: list[Filter],
-        ctx_group: list[int],
-    ) -> str:
+    def _time_join(self, leaf: Leaf, ctx_filters: list[Filter], ctx_group: list[int]) -> str:
         """Join the fact's actual date to the dates of the outer context.
 
         `dctx` holds the date-table part of the context (its filters and its
         group-by columns). A shift joins each actual date to the context date
-        it was shifted from; a to-date or rolling window joins a date range
-        ending at the last context date.
+        it was shifted from; the other operations join a date range derived
+        from the first ("d0") and last ("d") context dates.
         """
         d, model = self.d, self.model
         ctx = leaf.ctx
         t_key, c_key = ctx.time_col  # type: ignore[misc]
         table = model.table(t_key)
-        date_sql = d.to_date(colsql(t_key, c_key))
+        date_sql = d.to_date(self._row_sql(A.ColumnRef(table.name, model.column(t_key, c_key).name)))
         shifts = [op for op in ctx.time_ops if op.kind == "shift"]
         rng = ctx.time_ops[-1] if ctx.time_ops[-1].kind != "shift" else None
 
-        gcols = [f'{colsql(self.group_cols[i].table, self.group_cols[i].name)} AS "g{i}"' for i in ctx_group]
-        inner_where = ""
-        if ctx_filters:
-            inner_where = " WHERE " + " AND ".join(self._row_sql(f.expr, colsql) for f in ctx_filters)
-        inner_from = f"FROM {self.relation_for(table)} AS {d.quote(table.name)}{inner_where}"
+        refs = [self._group_ref(i) for i in ctx_group]
+        tables: set[str] = set()
+        for f in ctx_filters:
+            tables |= self._expr_tables(f.expr)
+        for ref in refs:
+            tables |= self._expr_tables(ref)
+        lines, conds = self._source(t_key, tables)
+        conds = conds + [self._row_sql(f.expr) for f in ctx_filters]
+        inner_from = " ".join(lines) + (" WHERE " + " AND ".join(conds) if conds else "")
+        gcols = [f'{self._row_sql(ref)} AS "g{i}"' for ref, i in zip(refs, ctx_group)]
 
-        date_alias = f'{date_sql} AS "d"'
         if rng is None:
+            date_alias = date_sql + ' AS "d"'
             inner = f"SELECT {', '.join([date_alias] + gcols)} {inner_from}"
             actual = date_sql
             for op in reversed(shifts):
                 actual = d.date_add(actual, -op.n, op.unit)
             cond = f'"dctx"."d" = {actual}'
         else:
-            max_alias = f'MAX({date_sql}) AS "d"'
-            inner = f"SELECT {', '.join(gcols + [max_alias])} {inner_from}"
-            if ctx_group:
-                inner += " GROUP BY " + ", ".join(
-                    colsql(self.group_cols[i].table, self.group_cols[i].name) for i in ctx_group
-                )
-            anchor = '"dctx"."d"'
+            bounds = [f'MIN({date_sql}) AS "d0"', f'MAX({date_sql}) AS "d"']
+            inner = f"SELECT {', '.join(gcols + bounds)} {inner_from}"
+            if refs:
+                inner += " GROUP BY " + ", ".join(self._row_sql(ref) for ref in refs)
+            first, last = '"dctx"."d0"', '"dctx"."d"'
             for op in shifts:
-                anchor = d.date_add(anchor, op.n, op.unit)
+                first, last = d.date_add(first, op.n, op.unit), d.date_add(last, op.n, op.unit)
             if rng.kind == "todate":
-                cond = f"{date_sql} <= {anchor}"
+                cond = f"{date_sql} <= {last}"
                 if rng.unit != "ALL":
-                    cond += f" AND {date_sql} >= {d.date_trunc(rng.unit, anchor)}"
-            else:  # rolling window of |n| units ending at the anchor
-                cond = f"{date_sql} <= {anchor} AND {date_sql} > {d.date_add(anchor, rng.n, rng.unit)}"
+                    cond += f" AND {date_sql} >= {d.date_trunc(rng.unit, last)}"
+            elif rng.kind == "window":  # rolling window of |n| units ending at the last date
+                cond = f"{date_sql} <= {last} AND {date_sql} > {d.date_add(last, rng.n, rng.unit)}"
+            elif rng.kind == "prev":  # the whole period before the one holding the first date
+                start = d.date_trunc(rng.unit, first)
+                cond = f"{date_sql} >= {d.date_add(start, -1, rng.unit)} AND {date_sql} < {start}"
+            elif rng.kind == "next":  # the whole period after the one holding the last date
+                start = d.date_add(d.date_trunc(rng.unit, last), 1, rng.unit)
+                cond = f"{date_sql} >= {start} AND {date_sql} < {d.date_add(start, 1, rng.unit)}"
+            else:  # parallel: whole periods, moved by n
+                cond = (
+                    f"{date_sql} >= {d.date_add(d.date_trunc(rng.unit, first), rng.n, rng.unit)} AND "
+                    f"{date_sql} < {d.date_add(d.date_trunc(rng.unit, last), rng.n + 1, rng.unit)}"
+                )
         return f'JOIN ({inner}) AS "dctx" ON {cond}'
 
     # -- final assembly --------------------------------------------------
@@ -1256,13 +1640,15 @@ class QueryCompiler:
         that joins every leaf to the spine."""
         d = self.d
         n_group = len(self.group_cols)
-        leaves = sorted(self.leaves.items(), key=lambda kv: kv[1])
         ctes: list[str] = []
+        leaves: list[tuple[object, int]] = []  # the leaves joined to the spine
         leaf_keys: list[tuple[int, ...]] = []
-        for leaf, idx in leaves:
+        for leaf, idx in sorted(self.leaves.items(), key=lambda kv: kv[1]):
             sql, keys = self._leaf_sql(leaf)
-            leaf_keys.append(keys)
             ctes.append(f'"l{idx}" AS (\n{_indent(sql)}\n)')
+            if not isinstance(leaf, TableLeaf):
+                leaves.append((leaf, idx))
+                leaf_keys.append(keys)
 
         if n_group == 0:
             from_ = ['FROM (SELECT 1 AS "one") AS "s"']
@@ -1332,21 +1718,21 @@ class QueryCompiler:
 
     def _dimension_spine(self) -> str:
         """All combinations of the group-by values, one sub-select per table."""
-        d, model = self.d, self.model
+        d = self.d
         by_table: dict[str, list[int]] = {}
         for i, c in enumerate(self.group_cols):
             by_table.setdefault(_k(c.table), []).append(i)
-
-        def colsql(table: str, column: str) -> str:
-            col = model.column(table, column)
-            return f"{d.quote(model.table(table).name)}.{d.quote(col.physical_name)}"
-
         parts = []
         for n, (tk, idxs) in enumerate(by_table.items()):
-            t = model.table(tk)
-            cols = ", ".join(f'{colsql(t.name, self.group_cols[i].name)} AS "g{i}"' for i in idxs)
-            sql = f"SELECT DISTINCT {cols} FROM {self.relation_for(t)} AS {d.quote(t.name)}"
-            conds = [self._row_sql(f.expr, colsql) for f in self.query_filters if f.tables == {tk}]
+            refs = [self._group_ref(i) for i in idxs]
+            filters = [f for f in self.query_filters if f.tables == {tk}]
+            tables: set[str] = set()
+            for node in refs + [f.expr for f in filters]:
+                tables |= self._expr_tables(node)
+            lines, conds = self._source(tk, tables)
+            conds = conds + [self._row_sql(f.expr) for f in filters]
+            cols = ", ".join(f'{self._row_sql(ref)} AS "g{i}"' for ref, i in zip(refs, idxs))
+            sql = f"SELECT DISTINCT {cols} " + " ".join(lines)
             if conds:
                 sql += " WHERE " + " AND ".join(conds)
             parts.append(f'({sql}) AS "d{n}"')

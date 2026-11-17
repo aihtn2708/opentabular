@@ -124,10 +124,29 @@ table Sales
 		formatString: #,##0
 		displayFolder: Level of detail
 
-	/// Rank of the product by revenue. Uses RANKX, which the compiler does not
-	/// support yet; kept here to show how `otab validate` reports it.
+	/// Rank of the product by revenue among all products.
 	measure 'Product Rank' = RANKX(ALL('Product'[Product]), [Total Sales])
 		formatString: 0
+		displayFolder: Ranking
+
+	/// Revenue of the three best-selling products.
+	measure 'Top 3 Products Sales' = SUMX(TOPN(3, VALUES('Product'[Product]), [Total Sales]), [Total Sales])
+		formatString: #,##0.00
+		displayFolder: Ranking
+
+	/// Average revenue per customer, evaluated customer by customer.
+	measure 'Avg Sales per Customer' = AVERAGEX(Customer, [Total Sales])
+		formatString: #,##0.00
+		displayFolder: Level of detail
+
+	/// Revenue in the calendar month before the first date in context.
+	measure 'Sales Previous Month' = CALCULATE([Total Sales], PREVIOUSMONTH('Date'[Date]))
+		formatString: #,##0.00
+		displayFolder: Time intelligence
+
+	/// Names of the best-selling products. Uses CONCATENATEX, which the compiler does
+	/// not support yet; kept here to show how `otab validate` reports it.
+	measure 'Top Product Names' = CONCATENATEX(TOPN(3, VALUES('Product'[Product]), [Total Sales]), 'Product'[Product], ", ")
 		displayFolder: Not yet supported
 
 	column 'Order ID'
@@ -166,6 +185,11 @@ table Sales
 		dataType: double
 		sourceColumn: discount
 		summarizeBy: none
+
+	/// Line value after discount (calculated column).
+	column 'Line Amount' = Sales[Quantity] * Sales[Unit Price] * (1 - Sales[Discount])
+		dataType: double
+		summarizeBy: sum
 
 	/// Sales channel: Online or Store.
 	column Channel

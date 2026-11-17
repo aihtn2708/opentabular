@@ -1,0 +1,5 @@
+/// Sees sales to customers in Vietnam only.
+role 'Vietnam Sales'
+	modelPermission: read
+
+	tablePermission Customer = Customer[Country] = "Vietnam"

@@ -12,10 +12,12 @@ The same model then serves three purposes:
 | **Analytics as code** | The model lives in git; `otab validate` and `otab test` check it in CI |
 | **Self-service AI** | An MCP server lets AI agents query measures by name; the compiler writes the SQL |
 | **Data apps** | `otab serve` gives a metrics explorer and hosts HTML apps that query measures through a small JavaScript client |
+| **Security** | Row-level security roles written in TMDL apply to every query; each person signs in with their own account |
 
 Every number carries its working: definition, owner, trust level, lineage and the SQL that ran.
 
-> **Status: prototype (0.2).** A documented subset of DAX is compiled, on DuckDB only.
+> **Status: prototype (0.3).** A documented subset of DAX is compiled. It runs on DuckDB and
+> PostgreSQL; Snowflake and BigQuery connections exist but have not been run against live accounts.
 > "OpenTabular" is a working name. The project is not affiliated with Microsoft.
 
 ## Quick start
@@ -96,16 +98,19 @@ partition (`schemaName`.`entityName`). Column names map through `sourceColumn`.
 | `otab search <words>` | Find measures and columns by name or description |
 | `otab lineage <measure>` | What a measure is built from, down to source columns, and what depends on it |
 | `otab query -m … -g … -f …` | Run a semantic query: measures, group-by columns, filters |
+| `otab dax "EVALUATE …"` | Run a DAX query |
 | `otab sql -m … -g … -f … [--dialect]` | Print the compiled SQL |
 | `otab test` | Run the metric tests in `tests/*.yml` |
 | `otab serve` | Metrics explorer, data apps and HTTP API on http://127.0.0.1:7979/ |
 | `otab mcp` | Serve the model to AI clients over MCP (stdio) |
 | `otab agent setup` | Write `AGENTS.md` and skills that teach coding agents to model and build apps |
+| `otab hash-password` | Make a password hash for a user in `opentabular.yml` |
 | `otab functions` | List supported DAX functions |
 
 Filters are DAX conditions on one column: `-f "'Date'[Year] = 2024"`,
 `-f 'Product[Color] IN {"Red", "Blue"}'`. `-m` also accepts an ad-hoc measure,
-`-m "Units = SUM(Sales[Quantity])"`, for exploration from the CLI.
+`-m "Units = SUM(Sales[Quantity])"`, for exploration from the CLI. `query`, `sql`, `dax` and
+`mcp` take `--role` and `--user` to run as a viewer with that security role.
 
 ## Explorer and data apps
 
@@ -142,8 +147,82 @@ The server binds to localhost by default. To listen on a public address it requi
 shared password (`OTAB_PASSWORD`); see [DEPLOY.md](DEPLOY.md) for a free hosted test
 deployment.
 
-HTTP API: `GET /api/model`, `POST /api/query`, `GET /api/measures/<name>`,
+HTTP API: `GET /api/model`, `POST /api/query`, `POST /api/dax`, `GET /api/measures/<name>`,
 `GET /api/search?q=`.
+
+## DAX queries
+
+Clients that already write DAX can send a query instead of a list of measures:
+
+```
+$ otab dax -p examples/sales 'EVALUATE TOPN(3,
+      SUMMARIZECOLUMNS(Product[Product], TREATAS({2024}, Date[Year]), "Revenue", [Total Sales]),
+      [Revenue], DESC)'
+Product[Product]  [Revenue]
+----------------  ---------
+Trail 700            35,190
+Trail 500            20,709
+City Cruiser         11,421
+```
+
+Accepted shapes: `SUMMARIZECOLUMNS`, `ROW`, `{ expression }`, `VALUES(column)`, each optionally
+inside `TOPN` or `CALCULATETABLE`, with `DEFINE MEASURE` and `ORDER BY`. `POST /api/dax` takes
+`{"queries": [{"query": "EVALUATE ..."}]}` and answers in the shape of Power BI's executeQueries
+REST API (`results[].tables[].rows[]`). On the server only model measures may be requested
+(`"Revenue", [Total Sales]`); expressions written in the query and `DEFINE MEASURE` need
+`--allow-adhoc`. This is not the XMLA protocol, so Power BI Desktop and Excel cannot connect to it.
+
+## Security
+
+Roles are part of the model, as in Power BI:
+
+```tmdl
+role 'Vietnam Sales'
+	modelPermission: read
+
+	tablePermission Customer = Customer[Country] = "Vietnam"
+```
+
+Who holds which role is deployment configuration in `opentabular.yml`:
+
+```yaml
+security:
+  users:
+    - name: alice
+      password_hash: pbkdf2_sha256$600000$...   # from `otab hash-password`
+      roles: [Vietnam Sales]
+    - name: owner
+      password_hash: pbkdf2_sha256$600000$...
+      admin: true                                # no row restriction
+```
+
+- A role's filter reaches fact tables through relationships, and is added beneath the DAX,
+  so `ALL()`, `REMOVEFILTERS()` and `CALCULATE` cannot remove it.
+- Several roles combine as in Power BI: per table, a person sees the rows any of their roles
+  allows; a role with no filter on a table allows all of its rows.
+- `USERNAME()` in a filter is the signed-in name, for per-person rules.
+- A signed-in user with no role sees nothing when the model defines roles.
+- Preview a role without accounts: `otab serve --role "Vietnam Sales"`, or
+  `otab query --role "Vietnam Sales" -m "Total Sales"`. Metric tests take `roles:` too.
+
+Not covered: object-level security (hiding columns or tables per role) and sign-in through an
+identity provider.
+
+## Databases
+
+```yaml
+connection:
+  type: postgres            # duckdb (default), postgres, snowflake, bigquery
+  dsn_env: DATABASE_URL     # name of the environment variable holding the connection string
+sources:
+  Sales: {table: analytics.fact_sales}
+```
+
+The compiler writes DuckDB SQL and translates it for the target database. PostgreSQL is tested:
+every measure of the two test models returns the same numbers as on DuckDB. Snowflake and
+BigQuery use the same path (`pip install "opentabular[snowflake]"` or `[bigquery]`) but have
+not been run against a live account, so expect to fix details. File sources (`.csv`,
+`.parquet`) work with DuckDB only.
 
 ## Trust and lineage
 
@@ -259,17 +338,18 @@ and for the places where results can differ from Power BI.
 
 ## Limits of the prototype
 
-- DuckDB is the only engine that runs queries. `otab sql --dialect` translates the SQL
-  for PostgreSQL, Snowflake, BigQuery, Databricks, Redshift, ClickHouse and MySQL, but
-  that output has only been checked to parse; it has not been run on those databases.
-- Context transition works over the values of columns. Row by row over a table,
-  `SUMX(Sales, [Measure])`, is rejected with an "unsupported" message, never silently
-  miscompiled.
-- Not compiled yet: calculated columns and tables, calculation groups, `USERELATIONSHIP`,
-  bidirectional and many-to-many relationships, row-level security, `RANKX`, `TOPN`.
+- DuckDB and PostgreSQL are tested. Snowflake and BigQuery connections, and
+  `otab sql --dialect` for other databases, produce SQL that has not been executed there.
+- A measure can be evaluated row by row over a table that has a key column (a dimension).
+  Over a table without one, `SUMX(Sales, [Measure])` is rejected with an "unsupported"
+  message, never silently miscompiled.
+- Not compiled yet: calculated tables, calculation groups, bidirectional and many-to-many
+  relationships, `TOPN` as a `CALCULATE` filter, `ALLSELECTED`, `TREATAS` inside measures,
+  `CONCATENATEX`, window functions, object-level security.
 - No Power BI engine was available to compare against. Results are checked against
-  hand-calculated values and hand-written SQL, not against Power BI itself.
-- `otab serve` has one optional shared password; it has no users, roles or permissions.
+  hand-calculated values, hand-written SQL, and DuckDB against PostgreSQL, not against
+  Power BI itself.
+- Sign-in is HTTP Basic with accounts in a file. There is no single sign-on.
 
 ## Related projects
 

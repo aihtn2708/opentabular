@@ -23,11 +23,13 @@ import yaml
 from .compiler import CompileError, CompiledQuery, OutputColumn, Query, QueryCompiler, UnsupportedError
 from .lineage import measure_lineage, used_by
 from .model import Measure, Model, Table
+from .security import Identity, SecurityError, row_filters
 from .tmdl import load_model
 
+from .connections import FILE_READERS as _FILE_READERS
+from .connections import ConnectionError_, Engine, open_engine
+
 CONFIG_NAME = "opentabular.yml"
-_FILE_READERS = {".csv": "read_csv_auto", ".tsv": "read_csv_auto", ".parquet": "read_parquet",
-                 ".json": "read_json_auto"}
 
 
 class ProjectError(Exception):
@@ -106,46 +108,95 @@ class Project:
         return f"{q(table.schema_name)}.{name}" if table.schema_name else name
 
     # -- connection ------------------------------------------------------
-    def connect(self):
+    def engine(self) -> Engine:
+        """The database this project runs on, opened on first use."""
         if self._con is not None:
             return self._con
-        conn_cfg = self.config.get("connection") or {}
-        kind = str(conn_cfg.get("type", "duckdb")).lower()
-        if kind != "duckdb":
-            raise ProjectError(f"connection type '{kind}' is not supported yet (only duckdb)")
-        import duckdb
-
-        database = str(conn_cfg.get("database", ":memory:"))
-        if database != ":memory:":
-            database = str((self.root / database).resolve())
-        con = duckdb.connect(database)
+        files: dict[str, Path] = {}
         for table in self.model.tables.values():
             src = self._source(table)
             if "file" not in src:
                 continue
             file = (self.root / str(src["file"])).resolve()
-            reader = _FILE_READERS.get(file.suffix.lower())
-            if reader is None:
+            if file.suffix.lower() not in _FILE_READERS:
                 raise ProjectError(f"sources.{table.name}: unsupported file type {file.suffix}")
             if not file.exists():
                 raise ProjectError(f"sources.{table.name}: file not found: {file}")
-            path_sql = "'" + str(file).replace("'", "''") + "'"
-            view = '"' + self._view_name(table).replace('"', '""') + '"'
-            con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM {reader}({path_sql})")
-        self._con = con
-        return con
+            files[self._view_name(table)] = file
+        try:
+            self._con = open_engine(self.config.get("connection") or {}, self.root, files)
+        except ConnectionError_ as e:
+            raise ProjectError(str(e)) from None
+        return self._con
+
+    def _query(self, sql: str) -> list[tuple]:
+        try:
+            return self.engine().query(sql)
+        except ConnectionError_ as e:
+            raise ProjectError(str(e)) from None
+
+    def connect(self):
+        """The underlying driver connection (a DuckDB connection by default)."""
+        return self.engine().raw
 
     # -- queries ---------------------------------------------------------
-    def compiler(self, allow_adhoc_measures: bool = False) -> QueryCompiler:
-        return QueryCompiler(self.model, self.relation_for, allow_adhoc_measures=allow_adhoc_measures)
+    def compiler(self, allow_adhoc_measures: bool = False, identity: Identity | None = None) -> QueryCompiler:
+        """`identity` selects the row-level security to apply; None means no
+        restriction (a developer working on the model)."""
+        try:
+            filters = row_filters(self.model, identity)
+        except SecurityError as e:
+            raise CompileError(str(e)) from None
+        return QueryCompiler(
+            self.model, self.relation_for, allow_adhoc_measures=allow_adhoc_measures,
+            row_filters=filters, user=identity.name if identity else None,
+        )
 
-    def compile(self, query: Query, allow_adhoc_measures: bool = False) -> CompiledQuery:
-        return self.compiler(allow_adhoc_measures).compile(query)
+    def compile(self, query: Query, allow_adhoc_measures: bool = False,
+                identity: Identity | None = None) -> CompiledQuery:
+        return self.compiler(allow_adhoc_measures, identity).compile(query)
 
-    def run(self, query: Query, allow_adhoc_measures: bool = False) -> Result:
-        compiled = self.compile(query, allow_adhoc_measures)
-        cur = self.connect().execute(compiled.sql)
-        return Result([c.name for c in compiled.columns], cur.fetchall(), compiled.sql, compiled.columns)
+    def run(self, query: Query, allow_adhoc_measures: bool = False,
+            identity: Identity | None = None) -> Result:
+        compiled = self.compile(query, allow_adhoc_measures, identity)
+        rows = self._query(compiled.sql)
+        return Result([c.name for c in compiled.columns], rows, compiled.sql, compiled.columns)
+
+    def run_dax(self, text: str, allow_adhoc_measures: bool = False,
+                identity: Identity | None = None) -> Result:
+        """Run a DAX query (EVALUATE ...). Columns are named as Power BI names
+        them: Table[Column] for columns, [Name] for measures."""
+        from .dax import ast as A
+        from .dax.query import DaxQueryError, parse_dax_query
+
+        try:
+            dq = parse_dax_query(text)
+        except DaxQueryError as e:
+            raise CompileError(str(e)) from None
+        group_by = [f"'{c.table}'[{c.column}]" for c in dq.group_by]
+        query = Query(measures=list(dq.measures), group_by=group_by, filters=list(dq.filters),
+                      limit=dq.limit, defines=list(dq.defines))
+        compiler = self.compiler(allow_adhoc_measures, identity)
+        probe = compiler.compile(Query(query.measures, group_by, query.filters, defines=query.defines))
+        by_source = {(c.source or "").casefold(): c.name for c in probe.columns if c.kind == "dimension"}
+        by_measure = {c.name.casefold(): c.name for c in probe.columns if c.kind == "measure"}
+        for expr, desc in dq.order_by:
+            name = None
+            if isinstance(expr, A.ColumnRef):
+                col = self.model.table(expr.table).column(expr.column) if self.model.has_table(expr.table) else None
+                if col is not None:
+                    name = by_source.get(f"{col.table}[{col.name}]".casefold())
+                else:
+                    name = by_measure.get(expr.column.casefold())
+            elif isinstance(expr, A.BareRef):
+                name = by_measure.get(expr.name.casefold())
+            if name is None:
+                raise CompileError("ORDER BY and TOPN can only order by a column or measure of the result")
+            query.order_by.append(name + (" desc" if desc else ""))
+        compiled = compiler.compile(query)
+        rows = self._query(compiled.sql)
+        names = [f"[{c.name}]" if c.kind == "measure" else str(c.source) for c in compiled.columns]
+        return Result(names, rows, compiled.sql, compiled.columns)
 
     # -- validation ------------------------------------------------------
     def validate(self, check_sources: bool = False) -> list[Issue]:
@@ -157,13 +208,26 @@ class Project:
             for u in self.model.unsupported
         ]
         compiler = self.compiler()
+        for role in self.model.roles.values():
+            for table, dax in role.table_filters.items():
+                try:
+                    QueryCompiler(self.model, self.relation_for, row_filters={table: dax}, user="someone")
+                except (UnsupportedError, CompileError) as e:
+                    level = "unsupported" if isinstance(e, UnsupportedError) else "error"
+                    issues.append(Issue(level, f"role '{role.name}'", str(e)))
+                except Exception as e:  # noqa: BLE001 - unknown table and the like
+                    issues.append(Issue("error", f"role '{role.name}'", str(e)))
         for table in self.model.tables.values():
             for col in table.columns.values():
-                if col.expression is not None:
-                    issues.append(Issue(
-                        "unsupported", f"'{table.name}'[{col.name}]",
-                        "calculated columns are not compiled yet; the column cannot be queried",
-                    ))
+                if col.expression is None:
+                    continue
+                where = f"'{table.name}'[{col.name}]"
+                try:
+                    compiler._calc_ast(col)
+                except UnsupportedError as e:
+                    issues.append(Issue("unsupported", where, str(e)))
+                except CompileError as e:
+                    issues.append(Issue("error", where, str(e)))
             for m in table.measures.values():
                 where = f"[{m.name}]"
                 try:
@@ -177,14 +241,14 @@ class Project:
                         "info", where, "no description (/// comment); AI clients rely on descriptions"
                     ))
         if check_sources:
-            con = self.connect()
+            engine = self.engine()
             for table in self.model.tables.values():
                 cols = [c for c in table.columns.values() if c.expression is None]
                 if not cols:
                     continue
                 rel = self.relation_for(table)
                 try:
-                    have = {d[0].casefold() for d in con.execute(f"SELECT * FROM {rel} LIMIT 0").description}
+                    have = engine.columns(rel)
                 except Exception as e:  # noqa: BLE001 - surface any driver error
                     issues.append(Issue("error", f"'{table.name}'", f"cannot read {rel}: {e}"))
                     continue
@@ -211,7 +275,7 @@ class Project:
                     {"ref": f"'{t.name}'[{c.name}]", "name": c.name, "type": c.data_type,
                      "description": c.description}
                     for c in t.columns.values()
-                    if (include_hidden or not c.is_hidden) and c.expression is None
+                    if include_hidden or not c.is_hidden
                 ],
             })
         measures = []
@@ -229,7 +293,8 @@ class Project:
              "active": r.is_active}
             for r in self.model.relationships
         ]
-        return {"model": self.model.name, "tables": tables, "measures": measures, "relationships": rels}
+        return {"model": self.model.name, "tables": tables, "measures": measures, "relationships": rels,
+                "roles": [r.name for r in self.model.roles.values()]}
 
 
     # -- lineage and search ----------------------------------------------
@@ -292,7 +357,7 @@ class Project:
             if t.is_hidden:
                 continue
             for c in t.columns.values():
-                if c.is_hidden or c.expression is not None:
+                if c.is_hidden:
                     continue
                 s = score(c.name, c.description, t.name)
                 if s:

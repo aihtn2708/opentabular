@@ -222,10 +222,13 @@ the user says the owner has approved the definition.
 
 {functions}
 
-Not supported yet: a measure referenced row by row inside an iterator over a
-table (`SUMX(Sales, [Measure])`), calculated columns, `USERELATIONSHIP`,
-`RANKX`, `TOPN`, `SELECTEDVALUE`. Iterating the values of a column is
-supported: `AVERAGEX(VALUES('Date'[Year Month]), [Total Sales])`.
+Not supported yet: a measure evaluated row by row over a table that has no
+key column (`SUMX(Sales, [Measure])`; iterate a dimension or `VALUES` of a
+column instead), `TOPN` as a CALCULATE filter, `ALLSELECTED`, `CONCATENATEX`,
+calculated tables, calculation groups.
+
+Security roles are TMDL too: `role 'Name'` with `tablePermission Table = <DAX
+condition>`. Check a role with `otab query --role "Name" -m "Measure"`.
 
 ## Commands
 

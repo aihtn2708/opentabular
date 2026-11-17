@@ -27,6 +27,7 @@ class Column:
     description: str | None = None
     format_string: str | None = None
     is_hidden: bool = False
+    is_key: bool = False
 
     @property
     def physical_name(self) -> str:
@@ -98,10 +99,20 @@ class Relationship:
 
 
 @dataclass
+class Role:
+    """A security role: a DAX row filter per table (row-level security)."""
+
+    name: str
+    table_filters: dict[str, str] = field(default_factory=dict)  # table name -> DAX
+    members: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Model:
     name: str = "Model"
     tables: dict[str, Table] = field(default_factory=dict)
     relationships: list[Relationship] = field(default_factory=list)
+    roles: dict[str, Role] = field(default_factory=dict)
     # Objects found in the TMDL that the engine does not act on yet.
     unsupported: list[str] = field(default_factory=list)
 
@@ -135,7 +146,19 @@ class Model:
         return [m for t in self.tables.values() for m in t.measures.values()]
 
     # -- relationship graph ----------------------------------------------
-    def paths_from(self, table: str) -> dict[str, list[Relationship]]:
+    def active_relationships(self, activated: frozenset[str] = frozenset()) -> list[Relationship]:
+        """Relationships in force. `activated` names inactive relationships
+        switched on by USERELATIONSHIP; each one replaces the other
+        relationships between the same two tables."""
+        on = [r for r in self.relationships if r.name in activated]
+        pairs = {frozenset((_key(r.from_table), _key(r.to_table))) for r in on}
+        for r in self.relationships:
+            if r.is_active and r.name not in activated \
+                    and frozenset((_key(r.from_table), _key(r.to_table))) not in pairs:
+                on.append(r)
+        return on
+
+    def paths_from(self, table: str, activated: frozenset[str] = frozenset()) -> dict[str, list[Relationship]]:
         """Tables reachable from `table` by following active many-to-one
         relationships, with the relationship path to each (shortest first).
 
@@ -143,18 +166,39 @@ class Model:
         result filters `table`.
         """
         start = _key(table)
+        rels = self.active_relationships(activated)
         paths: dict[str, list[Relationship]] = {start: []}
         queue = deque([start])
         while queue:
             cur = queue.popleft()
-            for rel in self.relationships:
-                if not rel.is_active or _key(rel.from_table) != cur:
+            for rel in rels:
+                if _key(rel.from_table) != cur:
                     continue
                 nxt = _key(rel.to_table)
                 if nxt not in paths:
                     paths[nxt] = paths[cur] + [rel]
                     queue.append(nxt)
         return paths
+
+    def key_column(self, table: str) -> Column | None:
+        """The column that identifies a row of `table`: one marked isKey, or
+        the column other tables relate to."""
+        t = self.table(table)
+        for c in t.columns.values():
+            if c.is_key:
+                return c
+        for r in self.relationships:
+            if _key(r.to_table) == _key(table):
+                return t.column(r.to_column)
+        return None
+
+    def find_relationship(self, a: tuple[str, str], b: tuple[str, str]) -> Relationship | None:
+        ka, kb = (_key(a[0]), _key(a[1])), (_key(b[0]), _key(b[1]))
+        for r in self.relationships:
+            ends = {(_key(r.from_table), _key(r.from_column)), (_key(r.to_table), _key(r.to_column))}
+            if ends == {ka, kb}:
+                return r
+        return None
 
     def expanded(self, table: str) -> frozenset[str]:
         return frozenset(self.paths_from(table))
@@ -182,4 +226,8 @@ class Model:
                     issues.append(f"Relationship {r.name}: {side} table '{tbl}' does not exist")
                 elif self.table(tbl).column(col) is None:
                     issues.append(f"Relationship {r.name}: {side} '{tbl}'[{col}] does not exist")
+        for role in self.roles.values():
+            for tbl in role.table_filters:
+                if not self.has_table(tbl):
+                    issues.append(f"Role '{role.name}': table '{tbl}' does not exist")
         return issues

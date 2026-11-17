@@ -76,7 +76,7 @@ def test_errors_are_json_and_ad_hoc_is_off_by_default(served):
     base, _ = served
     status, data = post(base + "/api/query", {"measures": ["Mine = SUM(Sales[Quantity])"]})
     assert status == 400 and "ad-hoc measures are disabled" in data["error"]
-    status, data = post(base + "/api/query", {"measures": ["Product Rank"]})
+    status, data = post(base + "/api/query", {"measures": ["Top Product Names"]})
     assert status == 400 and data["kind"] == "UnsupportedError"
     status, data = post(base + "/api/query", {"measures": ["Total Sales"], "limit": "many"})
     assert status == 400 and data["kind"] == "request"

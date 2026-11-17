@@ -29,6 +29,7 @@ import yaml
 
 from .compiler import CompileError, Query
 from .project import Project
+from .security import Identity
 
 
 @dataclass
@@ -70,7 +71,10 @@ def _query_from(spec: dict) -> Query:
 def run_test(project: Project, spec: dict, file: str) -> Outcome:
     name = str(spec.get("name", "(unnamed)"))
     try:
-        result = project.run(_query_from(spec.get("query") or {}))
+        identity = None
+        if spec.get("roles") or spec.get("user"):  # run the test as a restricted viewer
+            identity = Identity(spec.get("user"), list(spec.get("roles") or []))
+        result = project.run(_query_from(spec.get("query") or {}), identity=identity)
     except Exception as e:  # noqa: BLE001 - any failure fails the test
         return Outcome(name, file, False, f"query failed: {e}")
     expect = spec.get("expect") or {}

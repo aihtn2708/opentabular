@@ -51,7 +51,15 @@ query_options = [
                  help="DAX condition on one column, e.g. \"Product[Color] = \\\"Red\\\"\". Repeatable."),
     click.option("-o", "--order-by", "order_by", multiple=True, help='Output column, optionally " desc".'),
     click.option("-n", "--limit", type=int, default=None, help="Maximum number of rows."),
+    click.option("--role", "roles", multiple=True, help="Run as a viewer holding this security role. Repeatable."),
+    click.option("--user", default=None, help="Viewer name, returned by USERNAME() in role filters."),
 ]
+
+
+def _identity(roles, user):
+    from .security import Identity
+
+    return Identity(user, list(roles)) if roles or user else None
 
 
 def _with_query_options(fn):
@@ -125,13 +133,14 @@ def describe(project_path: str, as_json: bool) -> None:
 @click.option("--dialect", default="duckdb", show_default=True,
               help="Experimental: translate the SQL for another database (postgres, snowflake, "
                    "bigquery, databricks, redshift, clickhouse, mysql). Needs the 'dialects' extra.")
-def sql(project_path, measures, group_by, filters, order_by, limit, dialect) -> None:
+def sql(project_path, measures, group_by, filters, order_by, limit, roles, user, dialect) -> None:
     """Print the SQL a semantic query compiles to."""
     from .dialects import DialectError, transpile
 
     project = _load(project_path)
     try:
-        compiled = project.compile(_query(measures, group_by, filters, order_by, limit), True)
+        compiled = project.compile(_query(measures, group_by, filters, order_by, limit), True,
+                                   _identity(roles, user))
         click.echo(transpile(compiled.sql, dialect))
     except (CompileError, DialectError) as e:
         raise click.ClickException(str(e)) from None
@@ -175,14 +184,37 @@ def agent_setup_cmd(project_path: str) -> None:
 @project_option
 @_with_query_options
 @click.option("--json", "as_json", is_flag=True, help="Print rows as JSON.")
-def query(project_path, measures, group_by, filters, order_by, limit, as_json) -> None:
+def query(project_path, measures, group_by, filters, order_by, limit, roles, user, as_json) -> None:
     """Run a semantic query and print the result."""
     project = _load(project_path)
     try:
-        result = project.run(_query(measures, group_by, filters, order_by, limit), True)
+        result = project.run(_query(measures, group_by, filters, order_by, limit), True,
+                             _identity(roles, user))
     except (CompileError, ProjectError) as e:
         raise click.ClickException(str(e)) from None
     if as_json:
+        click.echo(json.dumps(result.records(), indent=2, default=str))
+    else:
+        click.echo(_table(result.columns, result.rows))
+
+
+@main.command()
+@project_option
+@click.argument("dax_query")
+@click.option("--role", "roles", multiple=True, help="Run as a viewer holding this security role. Repeatable.")
+@click.option("--user", default=None, help="Viewer name, returned by USERNAME() in role filters.")
+@click.option("--sql", "show_sql", is_flag=True, help="Print the compiled SQL instead of running it.")
+@click.option("--json", "as_json", is_flag=True, help="Print rows as JSON.")
+def dax(project_path: str, dax_query: str, roles, user, show_sql: bool, as_json: bool) -> None:
+    """Run a DAX query, for example: EVALUATE SUMMARIZECOLUMNS(T[Col], "Name", [Measure])."""
+    project = _load(project_path)
+    try:
+        result = project.run_dax(dax_query, True, _identity(roles, user))
+    except (CompileError, ProjectError) as e:
+        raise click.ClickException(str(e)) from None
+    if show_sql:
+        click.echo(result.sql)
+    elif as_json:
         click.echo(json.dumps(result.records(), indent=2, default=str))
     else:
         click.echo(_table(result.columns, result.rows))
@@ -211,13 +243,15 @@ def test(project_path: str, files: tuple[str, ...]) -> None:
 
 @main.command()
 @project_option
-def mcp(project_path: str) -> None:
+@click.option("--role", "roles", multiple=True, help="Answer as a viewer holding this security role. Repeatable.")
+@click.option("--user", default=None, help="Viewer name, returned by USERNAME() in role filters.")
+def mcp(project_path: str, roles: tuple[str, ...], user: str | None) -> None:
     """Serve the model to AI clients over MCP (stdio)."""
     from .mcp_server import serve
 
     project = _load(project_path)
     try:
-        serve(project)
+        serve(project, _identity(roles, user))
     except ProjectError as e:
         raise click.ClickException(str(e)) from None
 
@@ -230,20 +264,29 @@ def mcp(project_path: str) -> None:
 @click.option("--user", default="otab", show_default=True, envvar="OTAB_USER", help="User name for sign-in.")
 @click.option("--password", default=None, envvar="OTAB_PASSWORD",
               help="Require this shared password (HTTP Basic). Also read from OTAB_PASSWORD.")
-def serve(project_path: str, host: str, port: int, allow_adhoc: bool, user: str, password: str | None) -> None:
+@click.option("--role", "roles", multiple=True,
+              help="Without sign-in: answer as a viewer holding this role, to preview it. Repeatable.")
+def serve(project_path: str, host: str, port: int, allow_adhoc: bool, user: str, password: str | None,
+          roles: tuple[str, ...]) -> None:
     """Serve the metrics explorer, the data apps and the HTTP API."""
+    from .security import Identity, SecurityError
     from .server import make_server
 
-    if host not in ("127.0.0.1", "localhost", "::1") and not password:
+    project = _load(project_path)
+    has_users = bool((project.config.get("security") or {}).get("users"))
+    if host not in ("127.0.0.1", "localhost", "::1") and not password and not has_users:
         raise click.ClickException(
-            "refusing to listen on a public address without a password: "
-            "set OTAB_PASSWORD or pass --password"
+            "refusing to listen on a public address without a password: set OTAB_PASSWORD, "
+            "pass --password, or list security.users in opentabular.yml"
         )
     try:
-        server = make_server(project_path, host, port, allow_adhoc, user, password)
-    except (ProjectError, TmdlError) as e:
+        server = make_server(project_path, host, port, allow_adhoc, user, password,
+                             Identity("preview", list(roles)) if roles else None)
+    except (ProjectError, TmdlError, SecurityError) as e:
         raise click.ClickException(str(e)) from None
-    click.echo("Sign-in: " + (f"user '{user}' with the shared password" if password else "none (localhost only)"))
+    click.echo("Sign-in: " + ("personal accounts from opentabular.yml" if has_users
+                              else f"user '{user}' with the shared password" if password
+                              else "none (localhost only)"))
     click.echo(f"Explorer:  http://{host}:{port}/")
     for app in server.holder.apps():
         click.echo(f"App:       http://{host}:{port}/apps/{app}")
@@ -296,6 +339,15 @@ def search(project_path: str, text: str) -> None:
         click.echo(f"{h['kind']:<8} {label}" + (f"  {h['description']}" if h.get("description") else ""))
     if not hits:
         click.echo("no matches")
+
+
+@main.command("hash-password")
+@click.option("--password", prompt=True, hide_input=True, confirmation_prompt=True)
+def hash_password_cmd(password: str) -> None:
+    """Print a password hash for security.users in opentabular.yml."""
+    from .security import hash_password
+
+    click.echo(hash_password(password))
 
 
 @main.command()

@@ -1,6 +1,6 @@
 """OpenTabular: an open semantic layer built on TMDL and DAX."""
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 from .compiler import (  # noqa: E402
     CompileError,

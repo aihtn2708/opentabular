@@ -93,6 +93,11 @@
   catch (e) { $('notice').replaceChildren(el('p', { class: 'notice' }, 'The model could not be loaded: ' + e.message)); return; }
   $('model-name').textContent = model.model === 'Model' ? 'OpenTabular' : model.model;
   document.title = 'Explorer: ' + $('model-name').textContent;
+  if (model.viewer && !model.viewer.admin) {
+    const roles = model.viewer.roles.length ? model.viewer.roles.join(', ') : 'no role';
+    document.querySelector('aside .sub').textContent =
+      `Viewing as ${model.viewer.name || 'a viewer'} (${roles}). Rows outside that access are hidden.`;
+  }
   if (model.apps.length) {
     $('apps').replaceChildren(el('h2', {}, 'Data apps'), ...model.apps.map(a => el('a', { href: '/apps/' + a }, a)));
   }
