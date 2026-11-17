@@ -1601,7 +1601,8 @@ class QueryCompiler:
         gcols = [f'{self._row_sql(ref)} AS "g{i}"' for ref, i in zip(refs, ctx_group)]
 
         if rng is None:
-            inner = f"SELECT {', '.join([date_sql + ' AS \"d\"'] + gcols)} {inner_from}"
+            date_alias = date_sql + ' AS "d"'
+            inner = f"SELECT {', '.join([date_alias] + gcols)} {inner_from}"
             actual = date_sql
             for op in reversed(shifts):
                 actual = d.date_add(actual, -op.n, op.unit)
