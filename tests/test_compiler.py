@@ -214,6 +214,124 @@ def test_level_of_detail_combines_with_time_intelligence(tiny):
     assert rows == [(2024, pytest.approx(325))]
 
 
+# -- row-by-row iteration with measures -------------------------------------
+
+def test_iterating_a_dimension_table_with_a_measure(tiny):
+    # Product totals: A 600, B 900, C 150, D none.
+    assert one(tiny, "X = MAXX(Product, [Total])") == 900
+    assert one(tiny, "N = COUNTROWS(FILTER(Product, [Total] > 500))") == 2
+    # A row filter on the table plus a measure per row: the red products A and C.
+    assert one(tiny, 'X = SUMX(FILTER(Product, Product[Color] = "Red"), [Total])') == 750
+    # Row columns, bare [Column] references and arithmetic with the measure.
+    assert one(tiny, 'X = SUMX(Product, IF([Color] = "Blue", [Total] * 2, 0))') == 1800
+    rows = run(tiny, ["X = SUMX(Product, [Total] * 0.1)"], ["Product[Category]"])
+    assert rows[:2] == [("Bikes", pytest.approx(150)), ("Parts", pytest.approx(15))]
+    # ALL(table) ignores the outer product filter.
+    assert one(tiny, "X = MAXX(ALL(Product), [Total])", ['Product[Category] = "Parts"']) == 900
+
+
+# -- ranking and top N ------------------------------------------------------
+
+def test_rankx_over_column_values(tiny):
+    rows = run(tiny, ["Total", "Rank"], ["Product[Name]"])
+    # D has no sales, so it has no row. The sale with no product ranks last.
+    assert rows == [("A", 600, 2), ("B", 900, 1), ("C", 150, 3), (None, 50, 4)]
+    asc = run(tiny, ["R = RANKX(ALL(Product[Name]), [Total], , ASC)"], ["Product[Name]"])
+    assert asc == [("A", 3), ("B", 4), ("C", 2), (None, 1)]
+    # ALL(Product[Name]) keeps the category filter, so the rank restarts per category.
+    rows = run(tiny, ["Rank"], ["Product[Category]", "Product[Name]"])
+    assert rows == [("Bikes", "A", 2), ("Bikes", "B", 1), ("Parts", "C", 1), (None, None, 1)]
+
+
+def test_rankx_over_a_table_and_with_ties(tiny):
+    rows = run(tiny, ["R = RANKX(ALL(Product), [Total])"], ["Product[Name]"])
+    assert rows[:3] == [("A", 2), ("B", 1), ("C", 3)]
+    # Quantities by product: A 6, B 3, C 15, blank 1. By colour: Red 21, Blue 3.
+    # Rank colours by distinct sale years (both 2): a tie.
+    dax = "R = RANKX(ALL(Product[Color]), CALCULATE(DISTINCTCOUNT('Date'[Year])), , DESC, DENSE)"
+    assert run(tiny, [dax], ["Product[Color]"]) == [("Blue", 1), ("Red", 1)]
+
+
+def test_topn_as_an_iterator_source(tiny):
+    assert one(tiny, "X = SUMX(TOPN(2, VALUES(Product[Name]), [Total]), [Total])") == 1500
+    rows = run(tiny, ["X = SUMX(TOPN(1, VALUES(Product[Name]), [Total]), [Total])"], ["Product[Category]"])
+    assert rows == [("Bikes", 900), ("Parts", 150), (None, 50)]
+    # Order by one measure, sum another: the top product by quantity is C (15 units).
+    assert one(tiny, "X = SUMX(TOPN(1, VALUES(Product[Name]), [Qty]), [Total])") == 150
+    assert one(tiny, "X = SUMX(TOPN(2, Product, [Total]), [Total])") == 1500
+
+
+# -- single values ----------------------------------------------------------
+
+def test_selectedvalue_hasonevalue_and_isinscope(tiny):
+    rows = run(tiny, ["C = SELECTEDVALUE(Product[Category])"], ["Product[Name]"])
+    assert rows == [("A", "Bikes"), ("B", "Bikes"), ("C", "Parts"), ("D", "Parts")]
+    assert one(tiny, 'C = SELECTEDVALUE(Product[Color], "several")') == "several"
+    assert one(tiny, "H = HASONEVALUE(Product[Category])") is False
+    assert one(tiny, "H = HASONEVALUE(Product[Category])", ['Product[Category] = "Bikes"']) is True
+    # The usual guard: show the total only at the category level.
+    dax = "G = IF(ISINSCOPE(Product[Category]), [Total])"
+    assert run(tiny, [dax], ["Product[Category]"])[:2] == [("Bikes", 1500), ("Parts", 150)]
+    assert run(tiny, [dax]) == []
+    assert one(tiny, "F = ISFILTERED(Product[Color])", ['Product[Color] = "Red"']) is True
+    assert one(tiny, "F = ISFILTERED(Product[Color])") is False
+
+
+# -- inactive relationships -------------------------------------------------
+
+def test_userelationship_switches_the_date_used(tiny):
+    # Shipped amounts by month: 2023 Jan 200, Feb 50, Mar 300, Jul 100; 2024 Jan 300, Feb 100, Mar 600, Aug 50.
+    assert one(tiny, "Shipped") == 1700
+    by_month = dict(((y, m), v) for y, m, v in run(tiny, ["Shipped"], ["'Date'[Year]", "'Date'[MonthNo]"]))
+    assert by_month == {(2023, 1): 200, (2023, 2): 50, (2023, 3): 300, (2023, 7): 100,
+                        (2024, 1): 300, (2024, 2): 100, (2024, 3): 600, (2024, 8): 50}
+    # Ordered and shipped side by side use different joins in one query.
+    rows = run(tiny, ["Total", "Shipped"], ["'Date'[Year]", "'Date'[MonthNo]"], ["'Date'[Year] = 2024"])
+    assert rows == [(2024, 1, 300, 300), (2024, 2, 700, 100), (2024, 3, None, 600), (2024, 8, 50, 50)]
+    # Time intelligence follows the activated relationship: shipped in 2023 is 650.
+    dax = "X = CALCULATE([Shipped], SAMEPERIODLASTYEAR('Date'[Date]))"
+    assert run(tiny, [dax], ["'Date'[Year]"]) == [(2024, 650)]
+    with pytest.raises(CompileError, match="no relationship"):
+        tiny.compile(Query(["X = CALCULATE([Total], USERELATIONSHIP(Sales[Qty], 'Date'[Date]))"]), True)
+
+
+# -- calculated columns -----------------------------------------------------
+
+def test_calculated_columns_in_aggregations_grouping_and_filters(tiny):
+    assert one(tiny, "Amount Sum") == 1700
+    assert run(tiny, ["Amount Sum"], ["Sales[Category]"]) == [("Bikes", 1500), ("Parts", 150), (None, 50)]
+    # Product[Tone] is "Warm" for red products. The sale with no product has no tone.
+    assert run(tiny, ["Total"], ["Product[Tone]"]) == [("Cool", 900), ("Warm", 750), (None, 50)]
+    assert one(tiny, "Total", ['Product[Tone] = "Warm"']) == 750
+    # A CALCULATE filter on a calculated column replaces a grouping on that column.
+    rows = run(tiny, ['X = CALCULATE([Total], Product[Tone] = "Warm")'], ["Product[Tone]"])
+    assert rows == [("Cool", 750), ("Warm", 750)]
+    assert one(tiny, "X = SUMX(Sales, Sales[Amount] * 2)") == 3400
+
+
+# -- whole previous, next and parallel periods ------------------------------
+
+def test_previous_next_and_parallel_periods(tiny):
+    prev = dict(((y, m), v) for y, m, v in run(
+        tiny, ["P = CALCULATE([Total], PREVIOUSMONTH('Date'[Date]))"], ["'Date'[Year]", "'Date'[MonthNo]"]))
+    assert prev == {(2023, 2): 200, (2023, 3): 350, (2023, 8): 100, (2024, 2): 300, (2024, 3): 700, (2024, 9): 50}
+    nxt = dict(((y, m), v) for y, m, v in run(
+        tiny, ["N = CALCULATE([Total], NEXTMONTH('Date'[Date]))"], ["'Date'[Year]", "'Date'[MonthNo]"]))
+    assert nxt[(2023, 1)] == 350 and nxt[(2023, 12)] == 300
+    assert run(tiny, ["P = CALCULATE([Total], PREVIOUSYEAR('Date'[Date]))"], ["'Date'[Year]"]) == [(2024, 650)]
+    # A whole year back from February 2024 is all of 2023, unlike SAMEPERIODLASTYEAR (350).
+    par = dict(((y, m), v) for y, m, v in run(
+        tiny, ["P = CALCULATE([Total], PARALLELPERIOD('Date'[Date], -1, YEAR))"], ["'Date'[Year]", "'Date'[MonthNo]"]))
+    assert par[(2024, 2)] == 650 and par[(2024, 11)] == 650 and (2023, 2) not in par
+
+
+def test_datesbetween_replaces_the_date_filter(tiny):
+    dax = "X = CALCULATE([Total], DATESBETWEEN('Date'[Date], DATE(2023, 2, 1), DATE(2023, 7, 31)))"
+    assert one(tiny, dax) == 450
+    assert run(tiny, [dax], ["'Date'[Year]"]) == [(2023, 450), (2024, 450)]
+    assert one(tiny, "X = CALCULATE([Total], DATESBETWEEN('Date'[Date], DATE(2024, 2, 1), BLANK()))") == 750
+
+
 # -- query shape ------------------------------------------------------------
 
 def test_order_and_limit(tiny):
@@ -253,8 +371,9 @@ def test_invalid_queries(tiny, measures, group_by, filters, message):
     "X = SUMX(VALUES(Product[Category]), SUMX(VALUES(Product[Color]), [Total]))",
     "X = CALCULATE(AVERAGEX(VALUES('Date'[MonthNo]), [Total]), SAMEPERIODLASTYEAR('Date'[Date]))",
     "X = VAR t = [Total] RETURN SUMX(VALUES(Product[Category]), [Total] / t)",
-    "X = CALCULATE([Total], USERELATIONSHIP(Sales[SaleDate], 'Date'[Date]))",
-    "X = RANKX(ALL(Product), [Total])",
+    "X = CONCATENATEX(VALUES(Product[Name]), Product[Name])",
+    "X = CALCULATE([Total], TOPN(2, VALUES(Product[Name]), [Total]))",   # TOPN as a filter
+    "X = CALCULATE([Total], ALLSELECTED(Product))",
     "X = CALCULATE([YTD], DATESYTD('Date'[Date]))",           # to-date inside to-date
 ])
 def test_unsupported_dax_is_reported_not_miscompiled(tiny, dax):

@@ -259,7 +259,10 @@ class Parser:
                 args: list[A.Node] = []
                 if not self._is_op(")"):
                     while True:
-                        args.append(self.expression())
+                        if self._is_op(",") or self._is_op(")"):
+                            args.append(A.Call("BLANK", ()))  # omitted argument: F(a, , c)
+                        else:
+                            args.append(self.expression())
                         if self._is_op(","):
                             self.i += 1
                             continue

@@ -5,6 +5,7 @@
     GET  /apps/<name>          a data app: <project>/apps/<name>.html
     GET  /api/model            catalogue: tables, columns, measures, apps
     POST /api/query            run a semantic query (JSON body)
+    POST /api/dax              run DAX queries: {"queries": [{"query": "EVALUATE ..."}]}
     GET  /api/measures/<name>  definition, owner, trust level and lineage
     GET  /api/search?q=...     find measures and columns
 
@@ -14,10 +15,14 @@ on a page can show where it came from.
 
 The model is reloaded when a .tmdl or .yml file changes.
 
-Access: there are no user accounts. Bind to localhost (the default), or set a
-shared password (`--password` or the OTAB_PASSWORD environment variable) to
-require HTTP Basic sign-in on every route except /healthz. A shared password
-is enough for a test deployment; it is not per-user access control.
+Access (HTTP Basic on every route except /healthz):
+
+- `security.users` in opentabular.yml: each person signs in with their own
+  name and password, and their roles decide which rows they see.
+- a shared password (`--password` or OTAB_PASSWORD): one sign-in for everyone,
+  with no row restriction. Meant for a test deployment.
+- neither: no sign-in, localhost only. `--role` makes the server answer as a
+  viewer holding that role, to preview what such a person sees.
 """
 from __future__ import annotations
 
@@ -37,6 +42,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .compiler import CompileError, Query
 from .project import Project, ProjectError
+from .security import Identity, SecurityError, load_users, verify_password
 from .tmdl import TmdlError
 
 MAX_ROWS = 5000
@@ -82,7 +88,7 @@ class ProjectHolder:
         return sorted(p.stem for p in folder.glob("*.html")) if folder.is_dir() else []
 
 
-def run_query(project: Project, body: dict, allow_adhoc: bool) -> dict:
+def run_query(project: Project, body: dict, allow_adhoc: bool, identity: Identity | None = None) -> dict:
     def pick(*names: str, default=None):
         for n in names:
             if n in body and body[n] is not None:
@@ -99,7 +105,7 @@ def run_query(project: Project, body: dict, allow_adhoc: bool) -> dict:
         limit=limit + 1,
     )
     started = time.perf_counter()
-    result = project.run(q, allow_adhoc_measures=allow_adhoc)
+    result = project.run(q, allow_adhoc_measures=allow_adhoc, identity=identity)
     return {
         "columns": [
             {"name": c.name, "kind": c.kind, "format": c.format_string, "source": c.source,
@@ -113,26 +119,58 @@ def run_query(project: Project, body: dict, allow_adhoc: bool) -> dict:
     }
 
 
-def make_handler(holder: ProjectHolder, allow_adhoc: bool, user: str = "otab", password: str | None = None):
-    expected = None if not password else base64.b64encode(f"{user}:{password}".encode()).decode()
+def run_dax(project: Project, body: dict, allow_adhoc: bool, identity: Identity | None = None) -> dict:
+    """Answer in the shape of Power BI's executeQueries REST API, so a client
+    written for that API can be pointed here. Only the DAX query shapes listed
+    in opentabular.dax.query are accepted."""
+    queries = body.get("queries")
+    if queries is None and "query" in body:
+        queries = [{"query": body["query"]}]
+    if not isinstance(queries, list) or not queries:
+        raise ValueError('expected {"queries": [{"query": "EVALUATE ..."}]}')
+    results = []
+    for item in queries:
+        result = project.run_dax(str(item["query"]), allow_adhoc, identity)
+        rows = [dict(zip(result.columns, (_jsonable(v) for v in r))) for r in result.rows[:MAX_ROWS]]
+        results.append({"tables": [{"rows": rows}], "sql": result.sql})
+    return {"results": results}
 
+
+def make_handler(holder: ProjectHolder, allow_adhoc: bool, user: str = "otab", password: str | None = None,
+                 preview: Identity | None = None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "opentabular"
+        identity: Identity | None = None
+
+        def log_message(self, fmt: str, *args) -> None:  # quiet by default
+            pass
 
         def _authorised(self) -> bool:
-            if expected is None:
+            """Check the sign-in and set `self.identity` for this request."""
+            users = load_users(holder.project.config, holder.project.model)
+            if not users and not password:
+                self.identity = preview
                 return True
             scheme, _, token = (self.headers.get("Authorization") or "").partition(" ")
-            if scheme.lower() == "basic" and hmac.compare_digest(token.strip(), expected):
+            name = secret = ""
+            if scheme.lower() == "basic":
+                try:
+                    name, _, secret = base64.b64decode(token.strip()).decode().partition(":")
+                except (ValueError, UnicodeDecodeError):
+                    pass
+            for u in users:
+                if u.name.casefold() == name.casefold() and verify_password(secret, u.password_hash):
+                    self.identity = Identity(u.name, u.roles, u.admin)
+                    return True
+            if password and hmac.compare_digest(name.encode(), user.encode()) \
+                    and hmac.compare_digest(secret.encode(), password.encode()):
+                self.identity = Identity(name, admin=True)
                 return True
             self.send_response(401)
             self.send_header("WWW-Authenticate", 'Basic realm="OpenTabular", charset="UTF-8"')
             self.send_header("Content-Length", "0")
             self.end_headers()
             return False
-
-        def log_message(self, fmt: str, *args) -> None:  # quiet by default
-            pass
 
         # -- helpers -----------------------------------------------------
         def _send(self, status: int, body: bytes, content_type: str) -> None:
@@ -153,7 +191,7 @@ def make_handler(holder: ProjectHolder, allow_adhoc: bool, user: str = "otab", p
                     self._json(fn(holder.get()))
             except CompileError as e:
                 self._json({"error": str(e), "kind": type(e).__name__}, 400)
-            except (ProjectError, TmdlError) as e:
+            except (ProjectError, TmdlError, SecurityError) as e:
                 self._json({"error": str(e), "kind": "model"}, 500)
             except (ValueError, TypeError, KeyError) as e:
                 self._json({"error": f"bad request: {e}", "kind": "request"}, 400)
@@ -173,8 +211,11 @@ def make_handler(holder: ProjectHolder, allow_adhoc: bool, user: str = "otab", p
             if path == "/sdk.js":
                 return self._send(200, _asset("opentabular.js"), "text/javascript; charset=utf-8")
             if path == "/api/model":
+                who = self.identity
                 return self._guarded(lambda p: {
                     **p.describe(), "apps": holder.apps(), "allow_adhoc": allow_adhoc,
+                    "viewer": None if who is None else {
+                        "name": who.name, "roles": who.roles, "admin": who.admin},
                 })
             if path.startswith("/api/measures/"):
                 name = path[len("/api/measures/"):]
@@ -199,7 +240,8 @@ def make_handler(holder: ProjectHolder, allow_adhoc: bool, user: str = "otab", p
         def do_POST(self) -> None:  # noqa: N802
             if not self._authorised():
                 return
-            if urlparse(self.path).path != "/api/query":
+            route = urlparse(self.path).path
+            if route not in ("/api/query", "/api/dax"):
                 return self._json({"error": "not found"}, 404)
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -208,16 +250,20 @@ def make_handler(holder: ProjectHolder, allow_adhoc: bool, user: str = "otab", p
                     raise ValueError("expected a JSON object")
             except ValueError as e:
                 return self._json({"error": f"bad request: {e}", "kind": "request"}, 400)
-            self._guarded(lambda p: run_query(p, body, allow_adhoc))
+            who = self.identity
+            handler = run_dax if route == "/api/dax" else run_query
+            self._guarded(lambda p: handler(p, body, allow_adhoc, who))
 
     return Handler
 
 
 def make_server(project_path: str | Path, host: str = "127.0.0.1", port: int = 7979,
-                allow_adhoc: bool = False, user: str = "otab",
-                password: str | None = None) -> ThreadingHTTPServer:
+                allow_adhoc: bool = False, user: str = "otab", password: str | None = None,
+                preview: Identity | None = None) -> ThreadingHTTPServer:
     holder = ProjectHolder(project_path)
     holder.project.connect()
-    server = ThreadingHTTPServer((host, port), make_handler(holder, allow_adhoc, user, password))
+    load_users(holder.project.config, holder.project.model)  # fail early on a bad user list
+    server = ThreadingHTTPServer(
+        (host, port), make_handler(holder, allow_adhoc, user, password, preview))
     server.holder = holder  # type: ignore[attr-defined]
     return server

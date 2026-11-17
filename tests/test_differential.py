@@ -135,7 +135,7 @@ def test_time_intelligence_with_a_second_dimension(sales):
 
 
 def test_every_supported_example_measure_compiles_and_runs(sales):
-    names = [m.name for m in sales.model.all_measures() if m.name != "Product Rank"]
+    names = [m.name for m in sales.model.all_measures() if m.name != "Top Product Names"]
     rows = semantic(sales, names, ["'Date'[Year]"])
     assert [r[0] for r in rows] == [2023, 2024]
     assert all(v is not None for v in rows[1][1:])

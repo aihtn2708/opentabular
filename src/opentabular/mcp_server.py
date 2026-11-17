@@ -16,6 +16,7 @@ from typing import Any
 
 from .compiler import CompileError, Query
 from .project import Project
+from .security import Identity
 
 MAX_ROWS = 1000
 
@@ -56,12 +57,13 @@ def query_tool(
     filters: list[Any] | None = None,
     order_by: list[str] | None = None,
     limit: int | None = None,
+    identity: Identity | None = None,
 ) -> dict:
     limit = MAX_ROWS if limit is None else max(0, min(int(limit), MAX_ROWS))
     q = Query(measures=list(measures or []), group_by=list(group_by or []),
               filters=list(filters or []), order_by=list(order_by or []), limit=limit + 1)
     try:
-        result = project.run(q, allow_adhoc_measures=False)
+        result = project.run(q, allow_adhoc_measures=False, identity=identity)
     except CompileError as e:
         return {"error": str(e)}
     rows = result.rows[:limit]
@@ -77,7 +79,7 @@ def query_tool(
     }
 
 
-def build_server(project: Project):
+def build_server(project: Project, identity: Identity | None = None):
     try:  # mcp >= 2
         from mcp.server.mcpserver import MCPServer as _Server
     except ImportError:  # mcp 1.x
@@ -127,11 +129,12 @@ def build_server(project: Project):
         Returns columns, rows, whether the result was truncated, the trust
         level and owner of each measure, and the SQL that was run.
         """
-        return query_tool(project, measures, group_by, filters, order_by, limit)
+        return query_tool(project, measures, group_by, filters, order_by, limit, identity)
 
     return server
 
 
-def serve(project: Project) -> None:
+def serve(project: Project, identity: Identity | None = None) -> None:
+    """`identity` applies that viewer's row-level security to every query."""
     project.connect()
-    build_server(project).run()
+    build_server(project, identity).run()

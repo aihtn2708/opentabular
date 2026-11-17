@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .model import Column, Measure, Model, Relationship, Table
+from .model import Column, Measure, Model, Relationship, Role, Table
 
 
 class TmdlError(Exception):
@@ -341,7 +341,7 @@ def _split_column_ref(ref: str) -> tuple[str, str]:
 
 _IGNORED_TABLE_CHILDREN = {"annotation", "changedproperty", "extendedproperty", "variation"}
 _UNSUPPORTED_TABLE_CHILDREN = {"calculationgroup", "calculationitem"}
-_UNSUPPORTED_TOP = {"role", "function", "perspective"}
+_UNSUPPORTED_TOP = {"function", "perspective"}
 
 
 def build_model(nodes: list[Node], file: str | None = None) -> Model:
@@ -373,6 +373,13 @@ def build_model(nodes: list[Node], file: str | None = None) -> Model:
                     to_cardinality=str(n.prop("toCardinality", "one")),
                 )
             )
+        elif kind == "role":
+            role = model.roles.setdefault((n.name or "").casefold(), Role(n.name or ""))
+            for c in n.children:
+                if c.type.lower() == "tablepermission" and c.name and c.expr:
+                    role.table_filters[c.name] = c.expr
+                elif c.type.lower() == "member" and c.name:
+                    role.members.append(c.name)
         elif kind in _UNSUPPORTED_TOP:
             model.unsupported.append(f"{n.type} '{n.name}'")
     return model
@@ -399,6 +406,7 @@ def _add_table(model: Model, n: Node) -> None:
                 description=c.description,
                 format_string=(str(c.prop("formatString")) if c.prop("formatString") else None),
                 is_hidden=_as_bool(c.prop("isHidden")),
+                is_key=_as_bool(c.prop("isKey")),
             )
             table.columns[col.name.casefold()] = col
         elif kind == "measure":
